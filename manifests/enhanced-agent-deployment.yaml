@@ -1,0 +1,364 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubeaccess-system
+  labels:
+    name: kubeaccess-system
+    app.kubernetes.io/name: kubeaccess
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeaccess-enhanced-agent
+  namespace: kubeaccess-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeaccess-enhanced-agent
+rules:
+# Core resources for service discovery
+- apiGroups: [""]
+  resources: ["services", "endpoints", "pods", "nodes", "namespaces"]
+  verbs: ["get", "list", "watch"]
+# Extended resources for cluster management
+- apiGroups: [""]
+  resources: ["configmaps", "secrets", "persistentvolumes", "persistentvolumeclaims"]
+  verbs: ["get", "list", "watch"]
+# Apps and extensions
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions"]
+  resources: ["deployments", "replicasets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+# Networking
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies", "ingresses"]
+  verbs: ["get", "list", "watch"]
+# Batch jobs
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+# Autoscaling
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+# Custom resources
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["get", "list", "watch"]
+# Metrics
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+# Events
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+# For cluster info and version
+- apiGroups: [""]
+  resources: ["componentstatuses"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeaccess-enhanced-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeaccess-enhanced-agent
+subjects:
+- kind: ServiceAccount
+  name: kubeaccess-enhanced-agent
+  namespace: kubeaccess-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubeaccess-enhanced-config
+  namespace: kubeaccess-system
+type: Opaque
+stringData:
+  # Essential cluster configuration
+  cluster-id: "production-cluster-1"        # Unique cluster identifier
+  cluster-name: "Production EKS Cluster"    # Human-readable cluster name
+  region: "us-east-1"                       # Geographic region
+  
+  # DERP server configuration (P2P network)
+  derp-servers: "wss://derp1.kubeaccess.com/derp,wss://derp2.kubeaccess.com/derp,wss://derp3.kubeaccess.com/derp"
+  
+  # SaaS backend configuration
+  agent-token: "REPLACE_WITH_CLUSTER_AGENT_TOKEN"    # Generated during cluster registration
+  backend-url: "https://api.prysm.sh"          # Prysm SaaS backend URL
+  
+  # Optional: Custom cluster labels for organization
+  cluster-labels: '{"environment":"production","team":"platform","cost-center":"eng-001"}'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeaccess-enhanced-agent
+  namespace: kubeaccess-system
+  labels:
+    app: kubeaccess-enhanced-agent
+    version: v2
+spec:
+  replicas: 1  # Single instance per cluster
+  selector:
+    matchLabels:
+      app: kubeaccess-enhanced-agent
+  template:
+    metadata:
+      labels:
+        app: kubeaccess-enhanced-agent
+        version: v2
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: kubeaccess-enhanced-agent
+      containers:
+      - name: enhanced-agent
+        image: kubeaccess/enhanced-agent:latest
+        imagePullPolicy: Always
+        env:
+        # Cluster identification
+        - name: CLUSTER_ID
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-enhanced-config
+              key: cluster-id
+        - name: CLUSTER_NAME
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-enhanced-config
+              key: cluster-name
+        - name: REGION
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-enhanced-config
+              key: region
+        
+        # DERP network configuration
+        - name: DERP_SERVERS
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-enhanced-config
+              key: derp-servers
+        
+        # Backend authentication
+        - name: AGENT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-enhanced-config
+              key: agent-token
+        - name: BACKEND_URL
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-enhanced-config
+              key: backend-url
+        
+        # Kubernetes context
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        
+        # Optional cluster labels
+        - name: CLUSTER_LABELS
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-enhanced-config
+              key: cluster-labels
+              optional: true
+        
+        ports:
+        - containerPort: 8080
+          name: http-metrics
+          protocol: TCP
+        - containerPort: 9090
+          name: health
+          protocol: TCP
+        
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9090
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /cache
+      
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir: {}
+      
+      # Security and scheduling
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      
+      # Prefer scheduling on control plane nodes for better access
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+          - weight: 50
+            preference:
+              matchExpressions:
+              - key: node-role.kubernetes.io/master
+                operator: Exists
+      
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      - effect: NoExecute
+        operator: Exists
+        tolerationSeconds: 300
+      
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubeaccess-enhanced-agent
+  namespace: kubeaccess-system
+  labels:
+    app: kubeaccess-enhanced-agent
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+    name: metrics
+  - port: 9090
+    targetPort: 9090
+    protocol: TCP
+    name: health
+  selector:
+    app: kubeaccess-enhanced-agent
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubeaccess-enhanced-agent-config
+  namespace: kubeaccess-system
+data:
+  # Agent configuration
+  discovery-interval: "30s"
+  health-check-interval: "2m"
+  backend-sync-interval: "1m"
+  
+  # Service discovery configuration
+  discovery-namespaces: "*"  # "*" for all namespaces, or comma-separated list
+  include-system-services: "true"
+  include-endpoints: "true"
+  
+  # DERP network settings
+  derp-reconnect-interval: "5s"
+  derp-max-reconnect-delay: "5m"
+  derp-heartbeat-interval: "30s"
+  
+  # Logging configuration
+  log-level: "info"
+  log-format: "json"
+---
+# Optional: NetworkPolicy for enhanced security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kubeaccess-enhanced-agent-netpol
+  namespace: kubeaccess-system
+spec:
+  podSelector:
+    matchLabels:
+      app: kubeaccess-enhanced-agent
+  policyTypes:
+  - Egress
+  egress:
+  # Allow DNS resolution
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow HTTPS to DERP servers and backend
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+  # Allow access to Kubernetes API server
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 6443
+---
+# Optional: PodDisruptionBudget for high availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kubeaccess-enhanced-agent-pdb
+  namespace: kubeaccess-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: kubeaccess-enhanced-agent

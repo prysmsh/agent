@@ -1,0 +1,211 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubeaccess-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prysm-agent
+  namespace: kubeaccess-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prysm-agent
+rules:
+- apiGroups: [""]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: ["apps"]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: ["extensions"]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["*"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prysm-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prysm-agent
+subjects:
+- kind: ServiceAccount
+  name: prysm-agent
+  namespace: kubeaccess-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubeaccess-config
+  namespace: kubeaccess-system
+type: Opaque
+stringData:
+  # Configure these values for your cluster:
+  cluster-id: "production-cluster"  # Must match cluster ID from backend
+  region: "us-east-1"               # Geographic region for optimization
+  derp-server: "wss://derp.kubeaccess.com/derp"  # DERP relay server URL
+  agent-token: "REPLACE_WITH_CLUSTER_AGENT_TOKEN"  # Get from cluster creation API
+  backend-url: "https://api.prysm.sh"       # Prysm backend URL
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: prysm-agent
+  namespace: kubeaccess-system
+  labels:
+    app: prysm-agent
+spec:
+  selector:
+    matchLabels:
+      app: prysm-agent
+  template:
+    metadata:
+      labels:
+        app: prysm-agent
+    spec:
+      serviceAccountName: prysm-agent
+      hostNetwork: true
+      hostPID: true
+      privileged: true
+      containers:
+      - name: agent
+        image: kubeaccess/agent:latest
+        imagePullPolicy: Always
+        env:
+        - name: CLUSTER_ID
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-config
+              key: cluster-id
+        - name: REGION
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-config
+              key: region
+        - name: DERP_SERVER
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-config
+              key: derp-server
+        - name: AGENT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-config
+              key: agent-token
+        - name: BACKEND_URL
+          valueFrom:
+            secretKeyRef:
+              name: kubeaccess-config
+              key: backend-url
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # Deep Packet Inspection (DPI) - analyze traffic for threats
+        - name: TUNNEL_DAEMON_DPI_ENABLED
+          value: "true"
+        - name: TUNNEL_DAEMON_DPI_MODE
+          value: "detect"  # "detect" (log only) or "block" (block critical/high)
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - NET_ADMIN
+            - SYS_MODULE
+            - SYS_ADMIN
+        volumeMounts:
+        - name: wireguard-config
+          mountPath: /etc/wireguard
+        - name: modules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: kubeconfig
+          mountPath: /root/.kube
+          readOnly: true
+        - name: tunnel-pods
+          mountPath: /var/run/prysm
+        ports:
+        - containerPort: 51820
+          protocol: UDP
+          name: wireguard
+        - containerPort: 8080
+          protocol: TCP
+          name: http
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+      volumes:
+      - name: wireguard-config
+        hostPath:
+          path: /etc/wireguard
+          type: DirectoryOrCreate
+      - name: tunnel-pods
+        hostPath:
+          path: /var/run/prysm
+          type: DirectoryOrCreate
+      - name: modules
+        hostPath:
+          path: /lib/modules
+          type: Directory
+      - name: kubeconfig
+        hostPath:
+          path: /etc/kubernetes/admin.conf
+          type: File
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      - operator: Exists
+        effect: NoExecute
+      nodeSelector:
+        kubernetes.io/os: linux
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prysm-agent
+  namespace: kubeaccess-system
+  labels:
+    app: prysm-agent
+spec:
+  type: NodePort
+  ports:
+  - port: 51820
+    targetPort: 51820
+    protocol: UDP
+    name: wireguard
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: prysm-agent

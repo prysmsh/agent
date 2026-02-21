@@ -1,0 +1,1089 @@
+package plugins
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unsafe"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/rlimit"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"golang.org/x/sys/unix"
+
+	"kubeaccess-agent/metrics"
+)
+
+// eBPFPlugin provides kernel-level security and performance monitoring using eBPF
+type eBPFPlugin struct {
+	// Configuration
+	config       *eBPFConfig
+	nodeID       string
+	clusterID    string
+	
+	// eBPF program management
+	programs     map[string]*ebpf.Collection
+	links        map[string]link.Link
+	perfReaders  map[string]*perf.Reader
+	
+	// Event processing
+	eventQueue   chan *KernelEvent
+	eventStats   *EventStatistics
+	
+	// Plugin state
+	startTime    time.Time
+	lastCollection time.Time
+	errorCount   int64
+	eventsCount  int64
+	
+	// Prometheus metrics
+	prometheusCollector *eBPFPrometheusCollector
+	
+	// Synchronization
+	mu           sync.RWMutex
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+}
+
+// eBPFConfig holds eBPF plugin configuration
+type eBPFConfig struct {
+	// Node identification
+	NodeID      string `json:"node_id" yaml:"node_id"`
+	ClusterID   string `json:"cluster_id" yaml:"cluster_id"`
+	
+	// eBPF program settings
+	EnableNetworkMonitoring    bool `json:"enable_network_monitoring" yaml:"enable_network_monitoring"`
+	EnableProcessMonitoring    bool `json:"enable_process_monitoring" yaml:"enable_process_monitoring"`
+	EnableFileSystemMonitoring bool `json:"enable_filesystem_monitoring" yaml:"enable_filesystem_monitoring"`
+	EnableSecurityMonitoring   bool `json:"enable_security_monitoring" yaml:"enable_security_monitoring"`
+	EnablePerformanceMonitoring bool `json:"enable_performance_monitoring" yaml:"enable_performance_monitoring"`
+	
+	// Event filtering
+	MonitoredProcesses    []string `json:"monitored_processes" yaml:"monitored_processes"`
+	MonitoredDirectories  []string `json:"monitored_directories" yaml:"monitored_directories"`
+	MonitoredNetworkPorts []int    `json:"monitored_network_ports" yaml:"monitored_network_ports"`
+	
+	// Performance settings
+	EventBufferSize       int           `json:"event_buffer_size" yaml:"event_buffer_size"`
+	ProcessingWorkers     int           `json:"processing_workers" yaml:"processing_workers"`
+	EventProcessingDelay  time.Duration `json:"event_processing_delay" yaml:"event_processing_delay"`
+	PerformanceMode       string        `json:"performance_mode" yaml:"performance_mode"` // "low", "medium", "high"
+	
+	// Security settings
+	EnableMalwareDetection  bool    `json:"enable_malware_detection" yaml:"enable_malware_detection"`
+	EnableBehaviorAnalysis  bool    `json:"enable_behavior_analysis" yaml:"enable_behavior_analysis"`
+	SuspiciousThreshold     float64 `json:"suspicious_threshold" yaml:"suspicious_threshold"`
+	BlockSuspiciousActivity bool    `json:"block_suspicious_activity" yaml:"block_suspicious_activity"`
+	
+	// Container awareness
+	ContainerRuntime     string `json:"container_runtime" yaml:"container_runtime"`
+	EnableContainerIsolation bool `json:"enable_container_isolation" yaml:"enable_container_isolation"`
+}
+
+// KernelEvent represents an event captured by eBPF programs
+type KernelEvent struct {
+	// Event metadata
+	Timestamp    time.Time                `json:"timestamp"`
+	EventType    KernelEventType          `json:"event_type"`
+	Severity     metrics.Severity         `json:"severity"`
+	NodeID       string                   `json:"node_id"`
+	
+	// Process information
+	ProcessID    uint32                   `json:"process_id"`
+	ProcessName  string                   `json:"process_name"`
+	ProcessPath  string                   `json:"process_path"`
+	ParentPID    uint32                   `json:"parent_pid"`
+	UserID       uint32                   `json:"user_id"`
+	GroupID      uint32                   `json:"group_id"`
+	
+	// Container information (if applicable)
+	ContainerID   string                  `json:"container_id,omitempty"`
+	PodName       string                  `json:"pod_name,omitempty"`
+	Namespace     string                  `json:"namespace,omitempty"`
+	
+	// Network information (for network events)
+	SourceIP      string                  `json:"source_ip,omitempty"`
+	DestIP        string                  `json:"dest_ip,omitempty"`
+	SourcePort    uint16                  `json:"source_port,omitempty"`
+	DestPort      uint16                  `json:"dest_port,omitempty"`
+	Protocol      string                  `json:"protocol,omitempty"`
+	DataSize      uint64                  `json:"data_size,omitempty"`
+	
+	// File system information (for file events)
+	FilePath      string                  `json:"file_path,omitempty"`
+	FileOperation string                  `json:"file_operation,omitempty"`
+	FileMode      uint32                  `json:"file_mode,omitempty"`
+	
+	// Security context
+	SecurityEvent *SecurityEventDetails   `json:"security_event,omitempty"`
+	
+	// Raw event data
+	RawData       []byte                  `json:"raw_data,omitempty"`
+	
+	// Analysis results
+	ThreatScore   float64                 `json:"threat_score,omitempty"`
+	Anomalous     bool                    `json:"anomalous,omitempty"`
+	Tags          []string                `json:"tags,omitempty"`
+}
+
+// KernelEventType defines types of kernel events
+type KernelEventType string
+
+const (
+	EventTypeNetworkConnection KernelEventType = "network_connection"
+	EventTypeProcessExecution  KernelEventType = "process_execution"
+	EventTypeFileAccess        KernelEventType = "file_access"
+	EventTypeSystemCall        KernelEventType = "system_call"
+	EventTypeKernelModule      KernelEventType = "kernel_module"
+	EventTypeCapabilityChange  KernelEventType = "capability_change"
+	EventTypeNamespaceChange   KernelEventType = "namespace_change"
+	EventTypeSecurityViolation KernelEventType = "security_violation"
+	EventTypePerformanceAlert  KernelEventType = "performance_alert"
+)
+
+// SecurityEventDetails provides additional context for security events
+type SecurityEventDetails struct {
+	ViolationType    string                 `json:"violation_type"`
+	RiskLevel        metrics.ThreatLevel    `json:"risk_level"`
+	Indicators       []string               `json:"indicators"`
+	MitreAttackTactic string                `json:"mitre_attack_tactic,omitempty"`
+	MitreAttackTechnique string             `json:"mitre_attack_technique,omitempty"`
+	Recommendations  []string               `json:"recommendations"`
+	AutoBlocked      bool                   `json:"auto_blocked"`
+}
+
+// EventStatistics tracks event processing statistics
+type EventStatistics struct {
+	TotalEvents         int64                      `json:"total_events"`
+	EventsByType        map[KernelEventType]int64  `json:"events_by_type"`
+	EventsBySeverity    map[metrics.Severity]int64 `json:"events_by_severity"`
+	SecurityViolations  int64                      `json:"security_violations"`
+	BlockedEvents       int64                      `json:"blocked_events"`
+	ProcessingErrors    int64                      `json:"processing_errors"`
+	AverageProcessingTime time.Duration            `json:"average_processing_time"`
+	LastEventTime       time.Time                  `json:"last_event_time"`
+	mu                  sync.RWMutex
+}
+
+// eBPFPrometheusCollector handles eBPF-specific Prometheus metrics
+type eBPFPrometheusCollector struct {
+	// Event metrics
+	EventsTotal           *prometheus.CounterVec
+	EventsProcessingTime  *prometheus.HistogramVec
+	EventsInQueue         *prometheus.GaugeVec
+	
+	// Security metrics
+	SecurityViolations    *prometheus.CounterVec
+	ThreatScore           *prometheus.GaugeVec
+	BlockedEvents         *prometheus.CounterVec
+	
+	// Performance metrics
+	KernelCPUUsage        *prometheus.GaugeVec
+	KernelMemoryUsage     *prometheus.GaugeVec
+	eBPFProgramLoad       *prometheus.GaugeVec
+	
+	// Network metrics
+	NetworkConnections    *prometheus.CounterVec
+	NetworkBytesTotal     *prometheus.CounterVec
+	SuspiciousConnections *prometheus.CounterVec
+	
+	// File system metrics
+	FileOperations        *prometheus.CounterVec
+	SuspiciousFileAccess  *prometheus.CounterVec
+	
+	// Process metrics
+	ProcessExecutions     *prometheus.CounterVec
+	SuspiciousProcesses   *prometheus.CounterVec
+}
+
+// NeweBPFPlugin creates a new eBPF monitoring plugin
+func NeweBPFPlugin(nodeID, clusterID string) *eBPFPlugin {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	return &eBPFPlugin{
+		nodeID:       nodeID,
+		clusterID:    clusterID,
+		programs:     make(map[string]*ebpf.Collection),
+		links:        make(map[string]link.Link),
+		perfReaders:  make(map[string]*perf.Reader),
+		eventQueue:   make(chan *KernelEvent, 10000), // Large buffer for high-frequency events
+		eventStats:   NewEventStatistics(),
+		startTime:    time.Now(),
+		ctx:          ctx,
+		cancel:       cancel,
+		prometheusCollector: neweBPFPrometheusCollector(),
+	}
+}
+
+// NewEventStatistics creates a new event statistics tracker
+func NewEventStatistics() *EventStatistics {
+	return &EventStatistics{
+		EventsByType:     make(map[KernelEventType]int64),
+		EventsBySeverity: make(map[metrics.Severity]int64),
+	}
+}
+
+// Name returns the plugin name
+func (e *eBPFPlugin) Name() string {
+	return "ebpf"
+}
+
+// Description returns the plugin description
+func (e *eBPFPlugin) Description() string {
+	return "Kernel-level security and performance monitoring using eBPF programs"
+}
+
+// Initialize sets up the eBPF plugin
+func (e *eBPFPlugin) Initialize(ctx context.Context, config interface{}) error {
+	e.ctx = ctx
+	
+	// Parse configuration
+	if cfg, ok := config.(*eBPFConfig); ok && cfg != nil {
+		e.config = cfg
+	} else {
+		e.config = e.defaultConfig()
+	}
+	
+	// Override node and cluster IDs if provided
+	if e.nodeID != "" {
+		e.config.NodeID = e.nodeID
+	}
+	if e.clusterID != "" {
+		e.config.ClusterID = e.clusterID
+	}
+	
+	// Check if eBPF is supported
+	if err := e.checkeBPFSupport(); err != nil {
+		return fmt.Errorf("eBPF not supported: %w", err)
+	}
+	
+	// Remove memory limit for eBPF
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Printf("Warning: failed to remove memory limit: %v", err)
+	}
+	
+	// Load eBPF programs
+	if err := e.loadeBPFPrograms(); err != nil {
+		return fmt.Errorf("failed to load eBPF programs: %w", err)
+	}
+	
+	// Start event processors
+	for i := 0; i < e.config.ProcessingWorkers; i++ {
+		e.wg.Add(1)
+		go e.eventProcessor(i)
+	}
+	
+	// Start eBPF event readers
+	e.wg.Add(1)
+	go e.eventReader()
+	
+	log.Printf("eBPF plugin initialized for node: %s, cluster: %s", e.config.NodeID, e.config.ClusterID)
+	return nil
+}
+
+// checkeBPFSupport verifies that eBPF is available on the system
+func (e *eBPFPlugin) checkeBPFSupport() error {
+	// Check kernel version (eBPF requires Linux 3.18+, full features need 4.1+)
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("eBPF is only supported on Linux")
+	}
+	
+	// Try to create a simple eBPF program to test support
+	spec := &ebpf.ProgramSpec{
+		Type: ebpf.Kprobe,
+		Instructions: []ebpf.Instruction{
+			// Simple program that just returns
+			{OpCode: ebpf.OpCode(0x95), Dst: 0, Src: 0, Offset: 0, Constant: 0}, // BPF_EXIT
+		},
+		License: "GPL",
+	}
+	
+	prog, err := ebpf.NewProgram(spec)
+	if err != nil {
+		return fmt.Errorf("eBPF not available: %w", err)
+	}
+	prog.Close()
+	
+	log.Printf("eBPF support verified")
+	return nil
+}
+
+// loadeBPFPrograms loads and attaches eBPF programs based on configuration
+func (e *eBPFPlugin) loadeBPFPrograms() error {
+	var loadedPrograms []string
+	
+	// Load network monitoring programs
+	if e.config.EnableNetworkMonitoring {
+		if err := e.loadNetworkPrograms(); err != nil {
+			log.Printf("Warning: failed to load network programs: %v", err)
+		} else {
+			loadedPrograms = append(loadedPrograms, "network")
+		}
+	}
+	
+	// Load process monitoring programs
+	if e.config.EnableProcessMonitoring {
+		if err := e.loadProcessPrograms(); err != nil {
+			log.Printf("Warning: failed to load process programs: %v", err)
+		} else {
+			loadedPrograms = append(loadedPrograms, "process")
+		}
+	}
+	
+	// Load filesystem monitoring programs
+	if e.config.EnableFileSystemMonitoring {
+		if err := e.loadFilesystemPrograms(); err != nil {
+			log.Printf("Warning: failed to load filesystem programs: %v", err)
+		} else {
+			loadedPrograms = append(loadedPrograms, "filesystem")
+		}
+	}
+	
+	// Load security monitoring programs
+	if e.config.EnableSecurityMonitoring {
+		if err := e.loadSecurityPrograms(); err != nil {
+			log.Printf("Warning: failed to load security programs: %v", err)
+		} else {
+			loadedPrograms = append(loadedPrograms, "security")
+		}
+	}
+	
+	log.Printf("eBPF programs loaded: %v", loadedPrograms)
+	return nil
+}
+
+// loadNetworkPrograms loads eBPF programs for network monitoring
+func (e *eBPFPlugin) loadNetworkPrograms() error {
+	// This is a simplified example - in a real implementation,
+	// you would load actual eBPF bytecode from compiled C programs
+	
+	log.Printf("Loading network monitoring eBPF programs...")
+	
+	// For demonstration purposes, we'll simulate eBPF program loading
+	// In a production environment, this would compile and load actual eBPF programs
+	log.Printf("eBPF network monitoring enabled (simulation mode)")
+	return nil
+				},
+			},
+		},
+	}
+	
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return fmt.Errorf("failed to create network collection: %w", err)
+	}
+	
+	e.programs["network"] = coll
+	
+	// Attach to kernel probes (simplified)
+	// Real implementation would attach to tcp_connect, tcp_sendmsg, etc.
+	log.Printf("Network eBPF programs loaded successfully")
+	
+	return nil
+}
+
+// loadProcessPrograms loads eBPF programs for process monitoring
+func (e *eBPFPlugin) loadProcessPrograms() error {
+	log.Printf("Loading process monitoring eBPF programs...")
+	
+	// Similar structure for process monitoring
+	spec := &ebpf.CollectionSpec{
+		Maps: map[string]*ebpf.MapSpec{
+			"process_events": {
+				Type:       ebpf.PerfEventArray,
+				KeySize:    4,
+				ValueSize:  4,
+				MaxEntries: 1024,
+			},
+		},
+		Programs: map[string]*ebpf.ProgramSpec{
+			"trace_execve": {
+				Type:    ebpf.Kprobe,
+				License: "GPL",
+				Instructions: []ebpf.Instruction{
+					{OpCode: ebpf.OpCode(0x95)}, // BPF_EXIT
+				},
+			},
+		},
+	}
+	
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return fmt.Errorf("failed to create process collection: %w", err)
+	}
+	
+	e.programs["process"] = coll
+	log.Printf("Process eBPF programs loaded successfully")
+	
+	return nil
+}
+
+// loadFilesystemPrograms loads eBPF programs for filesystem monitoring
+func (e *eBPFPlugin) loadFilesystemPrograms() error {
+	log.Printf("Loading filesystem monitoring eBPF programs...")
+	
+	spec := &ebpf.CollectionSpec{
+		Maps: map[string]*ebpf.MapSpec{
+			"file_events": {
+				Type:       ebpf.PerfEventArray,
+				KeySize:    4,
+				ValueSize:  4,
+				MaxEntries: 1024,
+			},
+		},
+		Programs: map[string]*ebpf.ProgramSpec{
+			"trace_openat": {
+				Type:    ebpf.Kprobe,
+				License: "GPL",
+				Instructions: []ebpf.Instruction{
+					{OpCode: ebpf.OpCode(0x95)}, // BPF_EXIT
+				},
+			},
+		},
+	}
+	
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return fmt.Errorf("failed to create filesystem collection: %w", err)
+	}
+	
+	e.programs["filesystem"] = coll
+	log.Printf("Filesystem eBPF programs loaded successfully")
+	
+	return nil
+}
+
+// loadSecurityPrograms loads eBPF programs for security monitoring
+func (e *eBPFPlugin) loadSecurityPrograms() error {
+	log.Printf("Loading security monitoring eBPF programs...")
+	
+	spec := &ebpf.CollectionSpec{
+		Maps: map[string]*ebpf.MapSpec{
+			"security_events": {
+				Type:       ebpf.PerfEventArray,
+				KeySize:    4,
+				ValueSize:  4,
+				MaxEntries: 1024,
+			},
+		},
+		Programs: map[string]*ebpf.ProgramSpec{
+			"trace_security": {
+				Type:    ebpf.LSM,
+				License: "GPL",
+				Instructions: []ebpf.Instruction{
+					{OpCode: ebpf.OpCode(0x95)}, // BPF_EXIT
+				},
+			},
+		},
+	}
+	
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return fmt.Errorf("failed to create security collection: %w", err)
+	}
+	
+	e.programs["security"] = coll
+	log.Printf("Security eBPF programs loaded successfully")
+	
+	return nil
+}
+
+// eventReader reads events from eBPF perf buffers
+func (e *eBPFPlugin) eventReader() {
+	defer e.wg.Done()
+	
+	// Simulate reading events from eBPF programs
+	// In a real implementation, this would read from perf event arrays
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			// Generate synthetic events for demonstration
+			e.generateSyntheticEvents()
+		}
+	}
+}
+
+// generateSyntheticEvents creates sample events for demonstration
+// In a real implementation, this would be replaced with actual eBPF event reading
+func (e *eBPFPlugin) generateSyntheticEvents() {
+	events := []*KernelEvent{
+		{
+			Timestamp:   time.Now(),
+			EventType:   EventTypeNetworkConnection,
+			Severity:    metrics.SeverityInfo,
+			NodeID:      e.config.NodeID,
+			ProcessID:   12345,
+			ProcessName: "kubelet",
+			SourceIP:    "10.244.1.5",
+			DestIP:      "10.96.0.1",
+			DestPort:    443,
+			Protocol:    "tcp",
+			DataSize:    1024,
+		},
+		{
+			Timestamp:   time.Now(),
+			EventType:   EventTypeProcessExecution,
+			Severity:    metrics.SeverityInfo,
+			NodeID:      e.config.NodeID,
+			ProcessID:   23456,
+			ProcessName: "containerd",
+			ProcessPath: "/usr/bin/containerd",
+			ParentPID:   1,
+			UserID:      0,
+		},
+		{
+			Timestamp:    time.Now(),
+			EventType:    EventTypeFileAccess,
+			Severity:     metrics.SeverityLow,
+			NodeID:       e.config.NodeID,
+			ProcessID:    34567,
+			ProcessName:  "kube-proxy",
+			FilePath:     "/etc/kubernetes/config",
+			FileOperation: "read",
+		},
+	}
+	
+	for _, event := range events {
+		select {
+		case e.eventQueue <- event:
+		case <-e.ctx.Done():
+			return
+		default:
+			// Queue full, increment dropped events
+			e.eventStats.mu.Lock()
+			e.eventStats.ProcessingErrors++
+			e.eventStats.mu.Unlock()
+		}
+	}
+}
+
+// eventProcessor processes kernel events
+func (e *eBPFPlugin) eventProcessor(workerID int) {
+	defer e.wg.Done()
+	
+	log.Printf("eBPF event processor %d started", workerID)
+	
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case event := <-e.eventQueue:
+			start := time.Now()
+			e.processKernelEvent(event)
+			
+			// Update processing time statistics
+			processingTime := time.Since(start)
+			e.eventStats.mu.Lock()
+			e.eventStats.AverageProcessingTime = 
+				(e.eventStats.AverageProcessingTime + processingTime) / 2
+			e.eventStats.mu.Unlock()
+		}
+	}
+}
+
+// processKernelEvent analyzes and enriches a kernel event
+func (e *eBPFPlugin) processKernelEvent(event *KernelEvent) {
+	// Update statistics
+	e.eventStats.mu.Lock()
+	e.eventStats.TotalEvents++
+	e.eventStats.EventsByType[event.EventType]++
+	e.eventStats.EventsBySeverity[event.Severity]++
+	e.eventStats.LastEventTime = event.Timestamp
+	e.eventStats.mu.Unlock()
+	
+	// Perform security analysis
+	e.analyzeSecurityThreat(event)
+	
+	// Enrich with container information if available
+	e.enrichWithContainerInfo(event)
+	
+	// Update Prometheus metrics
+	e.updatePrometheusMetrics(event)
+	
+	// Log significant events
+	if event.Severity >= metrics.SeverityMedium {
+		log.Printf("eBPF Security Event: %s - %s (PID: %d, Process: %s)", 
+			event.EventType, event.Severity, event.ProcessID, event.ProcessName)
+	}
+}
+
+// analyzeSecurityThreat performs threat analysis on kernel events
+func (e *eBPFPlugin) analyzeSecurityThreat(event *KernelEvent) {
+	var threatScore float64
+	var indicators []string
+	var riskLevel metrics.ThreatLevel = metrics.ThreatLevelNone
+	
+	switch event.EventType {
+	case EventTypeNetworkConnection:
+		threatScore = e.analyzeNetworkThreat(event, &indicators)
+	case EventTypeProcessExecution:
+		threatScore = e.analyzeProcessThreat(event, &indicators)
+	case EventTypeFileAccess:
+		threatScore = e.analyzeFileAccessThreat(event, &indicators)
+	}
+	
+	// Determine risk level based on threat score
+	if threatScore >= 0.8 {
+		riskLevel = metrics.ThreatLevelCritical
+		event.Severity = metrics.SeverityHigh
+	} else if threatScore >= 0.6 {
+		riskLevel = metrics.ThreatLevelHigh
+		event.Severity = metrics.SeverityMedium
+	} else if threatScore >= 0.4 {
+		riskLevel = metrics.ThreatLevelMedium
+		event.Severity = metrics.SeverityLow
+	} else if threatScore >= 0.2 {
+		riskLevel = metrics.ThreatLevelLow
+	}
+	
+	event.ThreatScore = threatScore
+	event.Anomalous = threatScore > e.config.SuspiciousThreshold
+	
+	if len(indicators) > 0 {
+		event.SecurityEvent = &SecurityEventDetails{
+			ViolationType: "suspicious_activity",
+			RiskLevel:     riskLevel,
+			Indicators:    indicators,
+			Recommendations: e.generateRecommendations(event),
+		}
+		
+		e.eventStats.mu.Lock()
+		e.eventStats.SecurityViolations++
+		e.eventStats.mu.Unlock()
+		
+		// Block if configured and threat is high enough
+		if e.config.BlockSuspiciousActivity && threatScore >= 0.7 {
+			event.SecurityEvent.AutoBlocked = true
+			e.eventStats.mu.Lock()
+			e.eventStats.BlockedEvents++
+			e.eventStats.mu.Unlock()
+		}
+	}
+}
+
+// analyzeNetworkThreat analyzes network connections for threats
+func (e *eBPFPlugin) analyzeNetworkThreat(event *KernelEvent, indicators *[]string) float64 {
+	var score float64
+	
+	// Check for suspicious ports
+	suspiciousPorts := []uint16{1337, 31337, 4444, 6666}
+	for _, port := range suspiciousPorts {
+		if event.DestPort == port {
+			score += 0.3
+			*indicators = append(*indicators, fmt.Sprintf("suspicious_port_%d", port))
+		}
+	}
+	
+	// Check for unusual data volumes
+	if event.DataSize > 10*1024*1024 { // > 10MB
+		score += 0.2
+		*indicators = append(*indicators, "large_data_transfer")
+	}
+	
+	// Check for external connections from system processes
+	if strings.Contains(event.ProcessName, "systemd") || 
+	   strings.Contains(event.ProcessName, "kernel") {
+		if !strings.HasPrefix(event.DestIP, "10.") && 
+		   !strings.HasPrefix(event.DestIP, "172.") && 
+		   !strings.HasPrefix(event.DestIP, "192.168.") {
+			score += 0.4
+			*indicators = append(*indicators, "system_process_external_connection")
+		}
+	}
+	
+	return score
+}
+
+// analyzeProcessThreat analyzes process executions for threats
+func (e *eBPFPlugin) analyzeProcessThreat(event *KernelEvent, indicators *[]string) float64 {
+	var score float64
+	
+	// Check for suspicious process names
+	suspiciousNames := []string{"nc", "netcat", "wget", "curl", "python", "perl", "ruby"}
+	for _, name := range suspiciousNames {
+		if strings.Contains(strings.ToLower(event.ProcessName), name) {
+			score += 0.2
+			*indicators = append(*indicators, fmt.Sprintf("suspicious_process_%s", name))
+		}
+	}
+	
+	// Check for execution from unusual locations
+	suspiciousPaths := []string{"/tmp/", "/dev/shm/", "/var/tmp/"}
+	for _, path := range suspiciousPaths {
+		if strings.HasPrefix(event.ProcessPath, path) {
+			score += 0.3
+			*indicators = append(*indicators, "execution_from_tmp")
+		}
+	}
+	
+	// Check for privilege escalation (process running as different user than parent)
+	if event.UserID == 0 && event.ParentPID != 1 {
+		score += 0.4
+		*indicators = append(*indicators, "potential_privilege_escalation")
+	}
+	
+	return score
+}
+
+// analyzeFileAccessThreat analyzes file access for threats
+func (e *eBPFPlugin) analyzeFileAccessThreat(event *KernelEvent, indicators *[]string) float64 {
+	var score float64
+	
+	// Check for access to sensitive files
+	sensitiveFiles := []string{"/etc/passwd", "/etc/shadow", "/etc/ssh/", "/root/.ssh/"}
+	for _, file := range sensitiveFiles {
+		if strings.Contains(event.FilePath, file) {
+			score += 0.3
+			*indicators = append(*indicators, "sensitive_file_access")
+		}
+	}
+	
+	// Check for modification of system files
+	if event.FileOperation == "write" || event.FileOperation == "modify" {
+		systemPaths := []string{"/etc/", "/usr/bin/", "/usr/sbin/", "/boot/"}
+		for _, path := range systemPaths {
+			if strings.HasPrefix(event.FilePath, path) {
+				score += 0.4
+				*indicators = append(*indicators, "system_file_modification")
+			}
+		}
+	}
+	
+	return score
+}
+
+// enrichWithContainerInfo adds container context to events
+func (e *eBPFPlugin) enrichWithContainerInfo(event *KernelEvent) {
+	// In a real implementation, this would query the container runtime
+	// to get container ID, pod name, namespace etc. based on PID
+	
+	// For demonstration, we'll add mock container info for certain processes
+	if strings.Contains(event.ProcessName, "containerd") || 
+	   strings.Contains(event.ProcessName, "kubelet") {
+		event.ContainerID = fmt.Sprintf("container-%d", event.ProcessID)
+		event.PodName = fmt.Sprintf("pod-%s", event.ProcessName)
+		event.Namespace = "kube-system"
+	}
+}
+
+// generateRecommendations creates security recommendations based on events
+func (e *eBPFPlugin) generateRecommendations(event *KernelEvent) []string {
+	var recommendations []string
+	
+	switch event.EventType {
+	case EventTypeNetworkConnection:
+		recommendations = append(recommendations, 
+			"Review network policies",
+			"Monitor outbound connections",
+			"Consider firewall rules")
+	case EventTypeProcessExecution:
+		recommendations = append(recommendations,
+			"Review process execution policies",
+			"Implement application whitelisting",
+			"Monitor privilege escalation")
+	case EventTypeFileAccess:
+		recommendations = append(recommendations,
+			"Review file access permissions",
+			"Implement file integrity monitoring",
+			"Consider mandatory access controls")
+	}
+	
+	return recommendations
+}
+
+// updatePrometheusMetrics updates Prometheus metrics with event data
+func (e *eBPFPlugin) updatePrometheusMetrics(event *KernelEvent) {
+	labels := []string{e.config.NodeID, string(event.EventType), string(event.Severity)}
+	
+	e.prometheusCollector.EventsTotal.WithLabelValues(labels...).Inc()
+	
+	if event.ThreatScore > 0 {
+		e.prometheusCollector.ThreatScore.WithLabelValues(
+			e.config.NodeID, string(event.EventType)).Set(event.ThreatScore)
+	}
+	
+	if event.SecurityEvent != nil {
+		e.prometheusCollector.SecurityViolations.WithLabelValues(
+			e.config.NodeID, event.SecurityEvent.ViolationType).Inc()
+		
+		if event.SecurityEvent.AutoBlocked {
+			e.prometheusCollector.BlockedEvents.WithLabelValues(
+				e.config.NodeID, string(event.EventType)).Inc()
+		}
+	}
+	
+	// Update specific metrics based on event type
+	switch event.EventType {
+	case EventTypeNetworkConnection:
+		e.prometheusCollector.NetworkConnections.WithLabelValues(
+			e.config.NodeID, event.Protocol, event.DestIP).Inc()
+		e.prometheusCollector.NetworkBytesTotal.WithLabelValues(
+			e.config.NodeID, "outbound").Add(float64(event.DataSize))
+			
+	case EventTypeProcessExecution:
+		e.prometheusCollector.ProcessExecutions.WithLabelValues(
+			e.config.NodeID, event.ProcessName).Inc()
+			
+	case EventTypeFileAccess:
+		e.prometheusCollector.FileOperations.WithLabelValues(
+			e.config.NodeID, event.FileOperation).Inc()
+	}
+}
+
+// Collect gathers eBPF metrics
+func (e *eBPFPlugin) Collect(ctx context.Context) ([]metrics.Metric, error) {
+	start := time.Now()
+	defer func() {
+		e.lastCollection = time.Now()
+		e.prometheusCollector.EventsProcessingTime.WithLabelValues(e.config.NodeID).Observe(
+			time.Since(start).Seconds())
+	}()
+
+	var allMetrics []metrics.Metric
+	timestamp := time.Now()
+
+	// Get current statistics
+	e.eventStats.mu.RLock()
+	stats := *e.eventStats
+	e.eventStats.mu.RUnlock()
+
+	// Total events metric
+	allMetrics = append(allMetrics, metrics.Metric{
+		Name:      "ebpf_events_total",
+		Type:      metrics.MetricTypeCounter,
+		Value:     float64(stats.TotalEvents),
+		Labels: map[string]string{
+			"node_id":    e.config.NodeID,
+			"cluster_id": e.config.ClusterID,
+		},
+		Timestamp: timestamp,
+		Plugin:    e.Name(),
+		Component: "kernel",
+		Category:  metrics.CategorySecurity,
+		Severity:  metrics.SeverityInfo,
+	})
+
+	// Security violations metric
+	allMetrics = append(allMetrics, metrics.Metric{
+		Name:      "ebpf_security_violations_total",
+		Type:      metrics.MetricTypeCounter,
+		Value:     float64(stats.SecurityViolations),
+		Labels: map[string]string{
+			"node_id":    e.config.NodeID,
+			"cluster_id": e.config.ClusterID,
+		},
+		Timestamp: timestamp,
+		Plugin:    e.Name(),
+		Component: "security",
+		Category:  metrics.CategorySecurity,
+		Severity:  metrics.SeverityMedium,
+		Security: &metrics.SecurityContext{
+			ThreatLevel: metrics.ThreatLevelMedium,
+			Anomaly:     stats.SecurityViolations > 0,
+		},
+	})
+
+	// Events by type
+	for eventType, count := range stats.EventsByType {
+		allMetrics = append(allMetrics, metrics.Metric{
+			Name:      "ebpf_events_by_type",
+			Type:      metrics.MetricTypeCounter,
+			Value:     float64(count),
+			Labels: map[string]string{
+				"node_id":    e.config.NodeID,
+				"cluster_id": e.config.ClusterID,
+				"event_type": string(eventType),
+			},
+			Timestamp: timestamp,
+			Plugin:    e.Name(),
+			Component: "kernel",
+			Category:  metrics.CategorySecurity,
+			Severity:  metrics.SeverityInfo,
+		})
+	}
+
+	// Processing performance metric
+	allMetrics = append(allMetrics, metrics.Metric{
+		Name:      "ebpf_processing_time_avg_seconds",
+		Type:      metrics.MetricTypeGauge,
+		Value:     stats.AverageProcessingTime.Seconds(),
+		Labels: map[string]string{
+			"node_id":    e.config.NodeID,
+			"cluster_id": e.config.ClusterID,
+		},
+		Timestamp: timestamp,
+		Plugin:    e.Name(),
+		Component: "performance",
+		Category:  metrics.CategoryPerformance,
+		Severity:  metrics.SeverityInfo,
+	})
+
+	e.eventsCount += int64(len(allMetrics))
+	return allMetrics, nil
+}
+
+// PrometheusCollector returns the Prometheus collector
+func (e *eBPFPlugin) PrometheusCollector() prometheus.Collector {
+	return e.prometheusCollector
+}
+
+// Shutdown cleans up the eBPF plugin
+func (e *eBPFPlugin) Shutdown() error {
+	log.Printf("Shutting down eBPF plugin...")
+	
+	e.cancel()
+	e.wg.Wait()
+	
+	// Close eBPF programs and links
+	for name, link := range e.links {
+		if err := link.Close(); err != nil {
+			log.Printf("Error closing link %s: %v", name, err)
+		}
+	}
+	
+	for name, prog := range e.programs {
+		if err := prog.Close(); err != nil {
+			log.Printf("Error closing program %s: %v", name, err)
+		}
+	}
+	
+	// Close perf readers
+	for name, reader := range e.perfReaders {
+		if err := reader.Close(); err != nil {
+			log.Printf("Error closing perf reader %s: %v", name, err)
+		}
+	}
+	
+	log.Printf("eBPF plugin shutdown complete")
+	return nil
+}
+
+// Health returns plugin health status
+func (e *eBPFPlugin) Health() metrics.PluginHealth {
+	status := metrics.HealthStatusHealthy
+	if e.errorCount > 100 {
+		status = metrics.HealthStatusDegraded
+	}
+	if time.Since(e.lastCollection) > 2*time.Minute {
+		status = metrics.HealthStatusUnhealthy
+	}
+
+	return metrics.PluginHealth{
+		Status:         status,
+		LastCollection: e.lastCollection,
+		ErrorCount:     e.errorCount,
+		Uptime:         time.Since(e.startTime),
+		EventsCount:    e.eventsCount,
+		Details: map[string]string{
+			"node_id":         e.config.NodeID,
+			"cluster_id":      e.config.ClusterID,
+			"programs_loaded": strconv.Itoa(len(e.programs)),
+			"events_queued":   strconv.Itoa(len(e.eventQueue)),
+		},
+	}
+}
+
+// defaultConfig returns default eBPF configuration
+func (e *eBPFPlugin) defaultConfig() *eBPFConfig {
+	return &eBPFConfig{
+		EnableNetworkMonitoring:     true,
+		EnableProcessMonitoring:     true,
+		EnableFileSystemMonitoring:  true,
+		EnableSecurityMonitoring:    true,
+		EnablePerformanceMonitoring: false, // Disabled by default due to overhead
+		
+		EventBufferSize:       10000,
+		ProcessingWorkers:     4,
+		EventProcessingDelay:  100 * time.Millisecond,
+		PerformanceMode:       "medium",
+		
+		EnableMalwareDetection:      true,
+		EnableBehaviorAnalysis:      true,
+		SuspiciousThreshold:         0.5,
+		BlockSuspiciousActivity:     false, // Disabled by default for safety
+		
+		ContainerRuntime:            "containerd",
+		EnableContainerIsolation:    true,
+		
+		MonitoredProcesses:          []string{"kubelet", "containerd", "dockerd"},
+		MonitoredDirectories:        []string{"/etc/kubernetes", "/var/lib/kubelet"},
+		MonitoredNetworkPorts:       []int{22, 443, 6443, 10250},
+	}
+}
+
+// neweBPFPrometheusCollector creates Prometheus collector for eBPF metrics
+func neweBPFPrometheusCollector() *eBPFPrometheusCollector {
+	return &eBPFPrometheusCollector{
+		EventsTotal: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "kubeaccess_ebpf_events_total",
+				Help: "Total number of eBPF events processed",
+			},
+			[]string{"node_id", "event_type", "severity"},
+		),
+		
+		EventsProcessingTime: promauto.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "kubeaccess_ebpf_processing_time_seconds",
+				Help:    "Time spent processing eBPF events",
+				Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1},
+			},
+			[]string{"node_id"},
+		),
+		
+		SecurityViolations: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "kubeaccess_ebpf_security_violations_total",
+				Help: "Total number of security violations detected",
+			},
+			[]string{"node_id", "violation_type"},
+		),
+		
+		ThreatScore: promauto.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "kubeaccess_ebpf_threat_score",
+				Help: "Current threat score for events",
+			},
+			[]string{"node_id", "event_type"},
+		),
+		
+		NetworkConnections: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "kubeaccess_ebpf_network_connections_total",
+				Help: "Total number of network connections monitored",
+			},
+			[]string{"node_id", "protocol", "dest_ip"},
+		),
+		
+		ProcessExecutions: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "kubeaccess_ebpf_process_executions_total",
+				Help: "Total number of process executions monitored",
+			},
+			[]string{"node_id", "process_name"},
+		),
+		
+		FileOperations: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "kubeaccess_ebpf_file_operations_total",
+				Help: "Total number of file operations monitored",
+			},
+			[]string{"node_id", "operation"},
+		),
+	}
+}

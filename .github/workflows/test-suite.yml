@@ -1,0 +1,632 @@
+name: P2P DERP & K8s Agent Test Suite
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  GO_VERSION: '1.21'
+
+jobs:
+  # Unit Tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-suite: [
+          "derp-server",
+          "k8s-agent", 
+          "federation"
+        ]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+    
+    - name: Download dependencies
+      run: go mod download
+    
+    - name: Run unit tests
+      run: |
+        case "${{ matrix.test-suite }}" in
+          "derp-server")
+            go test -v -run "TestP2PDERPServer" -coverprofile=derp-coverage.out
+            ;;
+          "k8s-agent")
+            go test -v -run "TestEnhancedK8sAgent" -coverprofile=k8s-coverage.out
+            ;;
+          "federation")
+            go test -v -run "TestDERPFederation" -coverprofile=federation-coverage.out
+            ;;
+        esac
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./*-coverage.out
+        flags: unit-tests,${{ matrix.test-suite }}
+        name: ${{ matrix.test-suite }}-coverage
+
+  # Docker Compose Integration Tests
+  docker-compose-integration:
+    name: Docker Compose Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+    
+    - name: Download dependencies
+      run: go mod download
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build Docker images
+      run: |
+        # Build all required images
+        docker build -f Dockerfile.derp-server -t kubeaccess/derp-server:test .
+        docker build -f Dockerfile.k8s-agent -t kubeaccess/k8s-agent:test .
+        docker build -f Dockerfile.saas-backend -t kubeaccess/saas-backend:test .
+        docker build -f Dockerfile.ui -t kubeaccess/ui:test .
+    
+    - name: Start Docker Compose test stack
+      run: |
+        # Start the complete test infrastructure
+        docker-compose -f docker-compose.test.yml up -d postgres redis
+        
+        # Wait for database services to be healthy
+        echo "Waiting for PostgreSQL and Redis to be ready..."
+        timeout 60 bash -c 'until docker-compose -f docker-compose.test.yml ps postgres | grep "healthy"; do sleep 2; done'
+        timeout 60 bash -c 'until docker-compose -f docker-compose.test.yml ps redis | grep "healthy"; do sleep 2; done'
+        
+        # Start K3s clusters
+        docker-compose -f docker-compose.test.yml up -d k3s-server-1 k3s-server-2 k3s-server-3
+        
+        # Wait for K3s clusters to be ready
+        echo "Waiting for K3s clusters to be ready..."
+        timeout 180 bash -c 'until docker-compose -f docker-compose.test.yml ps k3s-server-1 | grep "healthy"; do sleep 5; done'
+        timeout 180 bash -c 'until docker-compose -f docker-compose.test.yml ps k3s-server-2 | grep "healthy"; do sleep 5; done'
+        timeout 180 bash -c 'until docker-compose -f docker-compose.test.yml ps k3s-server-3 | grep "healthy"; do sleep 5; done'
+        
+        # Start DERP servers
+        docker-compose -f docker-compose.test.yml up -d derp-server-1 derp-server-2 derp-server-3
+        
+        # Wait for DERP servers to be ready
+        echo "Waiting for DERP servers to be ready..."
+        timeout 60 bash -c 'until docker-compose -f docker-compose.test.yml ps derp-server-1 | grep "healthy"; do sleep 3; done'
+        timeout 60 bash -c 'until docker-compose -f docker-compose.test.yml ps derp-server-2 | grep "healthy"; do sleep 3; done'
+        timeout 60 bash -c 'until docker-compose -f docker-compose.test.yml ps derp-server-3 | grep "healthy"; do sleep 3; done'
+        
+        # Start SaaS backend
+        docker-compose -f docker-compose.test.yml up -d kubeaccess-saas-backend
+        
+        # Wait for SaaS backend to be ready
+        echo "Waiting for SaaS backend to be ready..."
+        timeout 120 bash -c 'until docker-compose -f docker-compose.test.yml ps kubeaccess-saas-backend | grep "healthy"; do sleep 5; done'
+        
+        # Start test workload provisioner
+        docker-compose -f docker-compose.test.yml up test-workload-provisioner
+        
+        # Start K8s agents
+        docker-compose -f docker-compose.test.yml up -d k8s-agent-1 k8s-agent-2 k8s-agent-3
+        
+        echo "Complete test infrastructure is running"
+    
+    - name: Wait for system stabilization
+      run: |
+        echo "Waiting for system to stabilize..."
+        sleep 30
+        
+        # Verify all services are running
+        docker-compose -f docker-compose.test.yml ps
+    
+    - name: Run comprehensive integration tests
+      run: |
+        # Test DERP server connectivity
+        echo "Testing DERP servers..."
+        curl -k https://localhost:8443/health || exit 1
+        curl -k https://localhost:8444/health || exit 1
+        curl -k https://localhost:8445/health || exit 1
+        
+        # Test SaaS backend API
+        echo "Testing SaaS backend API..."
+        curl -f http://localhost:8080/health || exit 1
+        curl -f http://localhost:8080/metrics || exit 1
+        curl -f http://localhost:8080/api/v1/clusters || exit 1
+        curl -f http://localhost:8080/api/v1/services || exit 1
+        curl -f http://localhost:8080/api/v1/derp/status || exit 1
+        curl -f http://localhost:8080/api/v1/derp/metrics || exit 1
+        curl -f http://localhost:8080/api/v1/derp/peers || exit 1
+        
+        # Test K3s cluster connectivity
+        echo "Testing K3s clusters..."
+        # Test cluster 1 (Production)
+        curl -k https://localhost:7443/version || exit 1
+        # Test cluster 2 (Staging)
+        curl -k https://localhost:7444/version || exit 1
+        # Test cluster 3 (Development)
+        curl -k https://localhost:7445/version || exit 1
+        
+        # Test service discovery
+        echo "Testing service discovery..."
+        sleep 10  # Allow agents to register and discover services
+        
+        # Check if agents have registered with the backend
+        CLUSTERS=$(curl -s http://localhost:8080/api/v1/clusters | jq '.clusters | length')
+        echo "Registered clusters: $CLUSTERS"
+        
+        # Check if services have been discovered
+        SERVICES=$(curl -s http://localhost:8080/api/v1/services | jq '.total')
+        echo "Discovered services: $SERVICES"
+        
+        # Verify metrics collection is working
+        METRICS=$(curl -s http://localhost:8080/metrics | jq '.total_requests')
+        echo "Total API requests: $METRICS"
+        
+        # Run Go-based integration tests
+        cd integration-tests && go test -v -run "TestDockerComposeIntegration" -timeout=10m
+    
+    - name: Generate integration test report
+      run: |
+        echo "# Docker Compose Integration Test Results" > integration-report.md
+        echo "" >> integration-report.md
+        echo "## Infrastructure Status" >> integration-report.md
+        echo "\`\`\`" >> integration-report.md
+        docker-compose -f docker-compose.test.yml ps >> integration-report.md
+        echo "\`\`\`" >> integration-report.md
+        echo "" >> integration-report.md
+        
+        echo "## API Endpoints Status" >> integration-report.md
+        echo "- SaaS Backend Health: $(curl -s http://localhost:8080/health | jq -r '.status')" >> integration-report.md
+        echo "- Total Clusters: $(curl -s http://localhost:8080/api/v1/clusters | jq '.clusters | length')" >> integration-report.md
+        echo "- Total Services: $(curl -s http://localhost:8080/api/v1/services | jq '.total')" >> integration-report.md
+        echo "- DERP Network Status: $(curl -s http://localhost:8080/api/v1/derp/status | jq -r '.network_status')" >> integration-report.md
+        echo "" >> integration-report.md
+        
+        echo "## Performance Metrics" >> integration-report.md
+        echo "\`\`\`json" >> integration-report.md
+        curl -s http://localhost:8080/metrics | jq . >> integration-report.md
+        echo "\`\`\`" >> integration-report.md
+    
+    - name: Collect logs on failure
+      if: failure()
+      run: |
+        echo "Collecting logs from failed services..."
+        mkdir -p logs
+        docker-compose -f docker-compose.test.yml logs kubeaccess-saas-backend > logs/saas-backend.log
+        docker-compose -f docker-compose.test.yml logs k8s-agent-1 > logs/k8s-agent-1.log
+        docker-compose -f docker-compose.test.yml logs k8s-agent-2 > logs/k8s-agent-2.log
+        docker-compose -f docker-compose.test.yml logs k8s-agent-3 > logs/k8s-agent-3.log
+        docker-compose -f docker-compose.test.yml logs derp-server-1 > logs/derp-server-1.log
+        docker-compose -f docker-compose.test.yml logs derp-server-2 > logs/derp-server-2.log
+        docker-compose -f docker-compose.test.yml logs derp-server-3 > logs/derp-server-3.log
+    
+    - name: Upload logs
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: integration-test-logs
+        path: logs/
+    
+    - name: Upload integration test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: integration-test-results
+        path: integration-report.md
+    
+    - name: Cleanup Docker Compose stack
+      if: always()
+      run: |
+        docker-compose -f docker-compose.test.yml down -v
+        docker system prune -f
+
+  # End-to-End Tests with UI
+  e2e-tests:
+    name: End-to-End Tests with UI
+    runs-on: ubuntu-latest
+    needs: docker-compose-integration
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+    
+    - name: Download dependencies
+      run: go mod download
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build and start complete stack with UI
+      run: |
+        # Build all images
+        docker build -f Dockerfile.derp-server -t kubeaccess/derp-server:test .
+        docker build -f Dockerfile.k8s-agent -t kubeaccess/k8s-agent:test .
+        docker build -f Dockerfile.saas-backend -t kubeaccess/saas-backend:test .
+        docker build -f Dockerfile.ui -t kubeaccess/ui:test .
+        
+        # Start complete stack including UI
+        docker-compose -f docker-compose.test.yml up -d
+        
+        # Wait for all services to be healthy
+        echo "Waiting for complete stack to be ready..."
+        timeout 300 bash -c 'until docker-compose -f docker-compose.test.yml ps kubeaccess-ui | grep "healthy"; do sleep 10; done'
+    
+    - name: Run E2E tests with UI automation
+      run: |
+        # Test UI accessibility
+        echo "Testing UI accessibility..."
+        curl -f http://localhost:3000/ || exit 1
+        
+        # Test API integration through UI
+        echo "Testing API integration..."
+        sleep 30  # Allow agents to register and discover services
+        
+        # Verify data flow: K8s clusters -> agents -> backend -> UI
+        CLUSTERS_API=$(curl -s http://localhost:8080/api/v1/clusters | jq '.clusters | length')
+        SERVICES_API=$(curl -s http://localhost:8080/api/v1/services | jq '.total')
+        
+        echo "API reports $CLUSTERS_API clusters and $SERVICES_API services"
+        
+        # Test DERP network functionality
+        DERP_STATUS=$(curl -s http://localhost:8080/api/v1/derp/status | jq -r '.network_status')
+        echo "DERP network status: $DERP_STATUS"
+        
+        # Test comprehensive metrics
+        METRICS=$(curl -s http://localhost:8080/metrics)
+        echo "Metrics collection working: $(echo $METRICS | jq -r '.database_connected')"
+        
+        # Run Go-based E2E tests
+        cd integration-tests && go test -v -run "TestE2EFullStack" -timeout=15m
+    
+    - name: Generate E2E test report
+      run: |
+        echo "# End-to-End Test Results" > e2e-report.md
+        echo "" >> e2e-report.md
+        echo "## Complete Stack Status" >> e2e-report.md
+        echo "\`\`\`" >> e2e-report.md
+        docker-compose -f docker-compose.test.yml ps >> e2e-report.md
+        echo "\`\`\`" >> e2e-report.md
+        echo "" >> e2e-report.md
+        
+        echo "## System Integration Results" >> e2e-report.md
+        echo "- UI Health: $(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/)" >> e2e-report.md
+        echo "- Backend Health: $(curl -s http://localhost:8080/health | jq -r '.status')" >> e2e-report.md
+        echo "- Registered Clusters: $(curl -s http://localhost:8080/api/v1/clusters | jq '.clusters | length')" >> e2e-report.md
+        echo "- Discovered Services: $(curl -s http://localhost:8080/api/v1/services | jq '.total')" >> e2e-report.md
+        echo "- DERP Network: $(curl -s http://localhost:8080/api/v1/derp/status | jq -r '.network_status')" >> e2e-report.md
+        echo "- Active DERP Servers: $(curl -s http://localhost:8080/api/v1/derp/status | jq '.active_servers')" >> e2e-report.md
+        
+        # Convert to JSON for artifact upload
+        cd integration-tests && go test -v -run "TestE2EFullStack" -json > e2e-results.json || true
+    
+    - name: Upload E2E test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: e2e-test-results
+        path: e2e-results.json
+
+  # Performance Tests
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    if: github.event_name == 'schedule' || contains(github.event.head_commit.message, '[perf-test]')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+    
+    - name: Download dependencies
+      run: go mod download
+    
+    - name: Run benchmark tests
+      run: |
+        go test -bench=. -benchmem -timeout=30m > benchmark-results.txt
+        cat benchmark-results.txt
+    
+    - name: Run load tests
+      run: |
+        go test -v -run "Test.*LoadTest|Test.*Stress" -timeout=30m
+    
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results
+        path: benchmark-results.txt
+
+  # Security Tests
+  security-tests:
+    name: Security Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Run Gosec Security Scanner
+      uses: securecodewarrior/github-action-gosec@master
+      with:
+        args: '-fmt sarif -out gosec-results.sarif ./...'
+    
+    - name: Upload SARIF file
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: gosec-results.sarif
+    
+    - name: Run govulncheck
+      run: |
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        govulncheck ./...
+
+  # Code Quality
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@v3
+      with:
+        version: latest
+        args: --timeout=10m
+    
+    - name: Run go vet
+      run: go vet ./...
+    
+    - name: Run gofmt
+      run: |
+        if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+          echo "The following files need gofmt:"
+          gofmt -s -l .
+          exit 1
+        fi
+    
+    - name: Check go mod tidy
+      run: |
+        go mod tidy
+        if ! git diff --quiet go.mod go.sum; then
+          echo "go.mod or go.sum needs to be updated"
+          git diff go.mod go.sum
+          exit 1
+        fi
+
+  # Build and Test Docker Images
+  docker-tests:
+    name: Docker Build Tests
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build DERP server image
+      run: |
+        docker build -f Dockerfile.derp-server -t kubeaccess/derp-server:test .
+    
+    - name: Build K8s agent image
+      run: |
+        docker build -f Dockerfile.k8s-agent -t kubeaccess/k8s-agent:test .
+    
+    - name: Test Docker images
+      run: |
+        # Test DERP server container
+        docker run --rm -d --name test-derp -p 8443:8443 kubeaccess/derp-server:test
+        sleep 5
+        curl -k https://localhost:8443/health || exit 1
+        docker stop test-derp
+        
+        # Test K8s agent container (dry run)
+        docker run --rm kubeaccess/k8s-agent:test --help
+
+  # Kubernetes Integration Tests
+  k8s-integration:
+    name: Kubernetes Integration
+    runs-on: ubuntu-latest
+    needs: docker-tests
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Create k3s cluster
+      uses: nolar/setup-k3d-k3s@v1
+      with:
+        version: v1.25
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Apply K8s manifests
+      run: |
+        # Update manifest with test values
+        sed -i 's/REPLACE_WITH_CLUSTER_AGENT_TOKEN/test-token/g' manifests/enhanced-agent-deployment.yaml
+        
+        # Apply manifests
+        kubectl apply -f manifests/enhanced-agent-deployment.yaml
+        
+        # Wait for deployment
+        kubectl wait --for=condition=available --timeout=300s deployment/kubeaccess-enhanced-agent -n kubeaccess-system
+    
+    - name: Test agent deployment
+      run: |
+        # Check pod status
+        kubectl get pods -n kubeaccess-system
+        
+        # Check logs
+        kubectl logs -l app=kubeaccess-enhanced-agent -n kubeaccess-system --tail=50
+        
+        # Test service endpoints
+        kubectl port-forward -n kubeaccess-system svc/kubeaccess-enhanced-agent 8080:8080 &
+        sleep 5
+        curl http://localhost:8080/metrics || exit 1
+
+  # Test Results Summary
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [unit-tests, docker-compose-integration, e2e-tests, security-tests, code-quality, k8s-integration]
+    if: always()
+    
+    steps:
+    - name: Download test artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: test-results
+    
+    - name: Generate test summary
+      run: |
+        echo "# Test Suite Results" > test-summary.md
+        echo "" >> test-summary.md
+        echo "## Job Status" >> test-summary.md
+        echo "- Unit Tests: ${{ needs.unit-tests.result }}" >> test-summary.md
+        echo "- Docker Compose Integration: ${{ needs.docker-compose-integration.result }}" >> test-summary.md
+        echo "- E2E Tests: ${{ needs.e2e-tests.result }}" >> test-summary.md
+        echo "- Security Tests: ${{ needs.security-tests.result }}" >> test-summary.md
+        echo "- Code Quality: ${{ needs.code-quality.result }}" >> test-summary.md
+        echo "- K8s Integration: ${{ needs.k8s-integration.result }}" >> test-summary.md
+        echo "" >> test-summary.md
+        echo "## Test Coverage" >> test-summary.md
+        echo "Coverage reports are available in the Codecov dashboard." >> test-summary.md
+        echo "" >> test-summary.md
+        echo "## Performance Results" >> test-summary.md
+        if [ -f test-results/performance-results/benchmark-results.txt ]; then
+          echo "Performance benchmarks completed. See artifacts for detailed results." >> test-summary.md
+        else
+          echo "Performance tests skipped (only run on schedule or with [perf-test] in commit message)." >> test-summary.md
+        fi
+    
+    - name: Upload test summary
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-summary
+        path: test-summary.md
+    
+    - name: Comment on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const summary = fs.readFileSync('test-summary.md', 'utf8');
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: summary
+          });
+
+  # Deployment (only on main branch)
+  deploy:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: test-summary
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Build and push images
+      run: |
+        # Build and push DERP server
+        docker build -f Dockerfile.derp-server -t ghcr.io/${{ github.repository }}/derp-server:${{ github.sha }} .
+        docker push ghcr.io/${{ github.repository }}/derp-server:${{ github.sha }}
+        
+        # Build and push K8s agent
+        docker build -f Dockerfile.k8s-agent -t ghcr.io/${{ github.repository }}/k8s-agent:${{ github.sha }} .
+        docker push ghcr.io/${{ github.repository }}/k8s-agent:${{ github.sha }}
+    
+    - name: Deploy to staging
+      run: |
+        echo "Deploying to staging environment..."
+        echo "DERP Server: ghcr.io/${{ github.repository }}/derp-server:${{ github.sha }}"
+        echo "K8s Agent: ghcr.io/${{ github.repository }}/k8s-agent:${{ github.sha }}"
+        # Add actual deployment steps here

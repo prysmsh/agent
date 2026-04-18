@@ -4,7 +4,7 @@ set -euo pipefail
 # Build script for prysm-agent image
 # Usage: ./scripts/build-secure.sh
 
-REPO="${DOCKER_REPO:-beehivesec/prysm-agent}"
+REPO="${DOCKER_REPO:-ghcr.io/prysmsh/agent}"
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo latest)}"
 
 echo "Building prysm-agent image..."

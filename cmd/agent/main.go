@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	metricsclient "k8s.io/metrics/pkg/client/clientset/versioned"
 )
@@ -27,27 +28,66 @@ func parseUint(s string) (uint, error) {
 	return uint(n), err
 }
 
+// retryOn5xx runs fn up to maxAttempts times; on 502 or 503 it backs off and retries.
+// Returns immediately on success or on non-5xx errors.
+func retryOn5xx(ctx context.Context, maxAttempts int, backoff time.Duration, fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		msg := lastErr.Error()
+		if !strings.Contains(msg, "502") && !strings.Contains(msg, "503") {
+			return lastErr
+		}
+		if attempt < maxAttempts-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff * time.Duration(attempt+1)):
+			}
+		}
+	}
+	return lastErr
+}
+
+// AgentComponentConfig holds desired image versions from the control plane.
+// Empty strings mean "use default".
+type AgentComponentConfig struct {
+	EBPFImage      string `json:"ebpf_image"`
+	LogImage       string `json:"log_image"`
+	CNIImage       string `json:"cni_image"`
+	FluentBitImage string `json:"fluentbit_image"`
+}
+
 // PrysmAgent is the main agent struct used by k8s_sa_provision, telemetry, derp, and log_daemonset_reconciler.
 type PrysmAgent struct {
-	clientset      kubernetes.Interface
-	metricsClient  *metricsclient.Clientset
-	discoveryConn  discovery.DiscoveryInterface
-	HTTPClient     *http.Client
-	BackendURL     string
-	AgentToken     string
-	ClusterID      string
-	ClusterName    string
-	Region         string
-	OrganizationID uint
-	kubeconfigPath string
-	lastTelemetry  time.Time
-	derpServers    []string
-	derpRegion     string
-	derpSkipVerify bool
-	derpManager    *derpManager
-	mtlsClient     *MTLSClient
-	tunnelDaemon   *tunnelDaemon
-	ccRouteManager *crossClusterRouteManager
+	clientset       kubernetes.Interface
+	dynamicClient   dynamic.Interface
+	metricsClient   *metricsclient.Clientset
+	discoveryConn   discovery.DiscoveryInterface
+	HTTPClient      *http.Client
+	BackendURL      string
+	AgentToken      string
+	ClusterID       string
+	ClusterName     string
+	Region          string
+	OrganizationID  uint
+	kubeconfigPath  string
+	apiServerURL    string // reachable K8s API URL for backend proxy (set when KUBECONFIG_APISERVER is set)
+	lastTelemetry   time.Time
+	derpServers     []string
+	derpRegion      string
+	derpSkipVerify  bool
+	derpManager     *derpManager
+	mtlsClient      *MTLSClient
+	tunnelDaemon    *tunnelDaemon
+	ccRouteManager  *crossClusterRouteManager
+	ComponentConfig AgentComponentConfig
 }
 
 func main() {
@@ -85,7 +125,10 @@ func main() {
 		kubeconfigPath: getEnvOrDefault("KUBECONFIG", ""),
 		derpRegion:     getEnvOrDefault("DERP_REGION", ""),
 		derpSkipVerify: getEnvOrDefault("DERP_SKIP_TLS_VERIFY", "") == "true" || getEnvOrDefault("DERP_SKIP_TLS_VERIFY", "") == "1",
-		HTTPClient:     &http.Client{Timeout: 30 * time.Second},
+		HTTPClient: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: &userAgentTransport{base: http.DefaultTransport},
+		},
 	}
 	if servers := getEnvOrDefault("DERP_SERVERS", getEnvOrDefault("DERP_SERVER", "")); servers != "" {
 		agent.derpServers = strings.Split(servers, ",")
@@ -98,16 +141,32 @@ func main() {
 		log.Printf("Kubernetes init failed: %v (continuing without k8s)", err)
 	}
 
+	// Restore cluster ID from state file if not provided by environment
+	if agent.ClusterID == "" {
+		if saved, err := agent.loadClusterID(); err == nil && saved != "" {
+			agent.ClusterID = saved
+			log.Printf("Restored CLUSTER_ID=%s from state file", agent.ClusterID)
+		}
+	}
+
+	// Prefer persisted cluster-bound token (issued by backend on first registration)
+	// over the bootstrap token from the environment, so DERP auth succeeds.
+	if saved, err := agent.loadAgentToken(); err == nil && saved != "" {
+		agent.AgentToken = saved
+		log.Printf("Restored cluster-bound agent token from state file")
+	}
+
 	ctx := context.Background()
 
-	// Auto-register with the backend to obtain a cluster ID
+	// Always register/validate with the backend on startup to get the canonical cluster ID.
+	// This handles stale cluster IDs (e.g. after a backend DB reset) automatically.
 	if agent.BackendURL != "" && agent.AgentToken != "" {
 		if err := agent.autoRegister(ctx); err != nil {
-			log.Printf("Auto-registration failed: %v", err)
 			if agent.ClusterID == "" {
+				log.Printf("Auto-registration failed: %v", err)
 				log.Fatal("No CLUSTER_ID and auto-registration failed, cannot continue")
 			}
-			log.Printf("Falling back to CLUSTER_ID=%s from environment", agent.ClusterID)
+			log.Printf("Registration validation failed (using cached cluster ID %s): %v", agent.ClusterID, err)
 		}
 	}
 
@@ -123,6 +182,14 @@ func main() {
 			agent.mtlsClient.StartRenewalLoop(ctx)
 			log.Println("✅ Using mTLS authentication for control plane communication")
 		}
+	}
+
+	// Fetch component config overrides from backend (before reconcilers start)
+	agent.fetchComponentConfig(ctx)
+
+	// Reconcile agent's own RBAC (ensures ClusterRole has all required permissions)
+	if agent.clientset != nil {
+		agent.ensureAgentRBAC(ctx)
 	}
 
 	// K8s SA provisioning (prysm-system SAs for proxy auth)
@@ -143,6 +210,7 @@ func main() {
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for range ticker.C {
+				agent.fetchComponentConfig(ctx)
 				agent.ensureLogCollectorDaemonSet(ctx)
 			}
 		}()
@@ -177,16 +245,49 @@ func main() {
 	agent.ccRouteManager = newCrossClusterRouteManager(agent)
 	go agent.ccRouteManager.Start(ctx)
 
+	// CRD controller: install CrossClusterRoute CRD and start bidirectional sync
+	if agent.dynamicClient != nil && agent.clientset != nil {
+		if restCfg, err := agent.loadKubeConfig(); err == nil {
+			// Try to ensure RBAC for CRD management (may fail if agent can't self-escalate;
+			// that's OK if the Helm chart already grants these permissions)
+			if err := ensureCRDRBAC(ctx, agent.clientset); err != nil {
+				log.Printf("ccr-crd: RBAC self-setup failed (may already be granted by Helm): %v", err)
+			}
+			// Ensure namespace-scoped Roles for secrets and serviceaccounts/token.
+			// These replace the former cluster-wide secret access in the agent ClusterRole.
+			if err := ensureNamespacedRBAC(ctx, agent.clientset); err != nil {
+				log.Printf("namespaced-rbac: setup failed: %v (continuing)", err)
+			}
+			// Attempt CRD install regardless — permissions may come from Helm chart
+			if err := ensureCRD(ctx, restCfg); err != nil {
+				log.Printf("ccr-crd: install failed: %v (continuing without CRD support)", err)
+			} else {
+				agent.startCCRController(ctx)
+			}
+			if err := ensureClusterTunnelCRD(ctx, restCfg); err != nil {
+				log.Printf("cluster-tunnel-crd: install failed: %v (continuing)", err)
+			} else {
+				agent.startClusterTunnelController(ctx)
+			}
+			if err := ensureMeshRouteCRD(ctx, restCfg); err != nil {
+				log.Printf("mesh-route-crd: install failed: %v (continuing)", err)
+			} else {
+				agent.startMeshRouteController(ctx)
+			}
+		}
+	}
+
 	// Exit node controller: when cluster is exit router, enable IP forwarding and NAT
 	agent.startExitNodeController(ctx)
 	if agent.clientset != nil {
 		go agent.clusterTelemetryLoop(ctx)
 		go agent.vulnerabilityScannerLoop(ctx)
-		go agent.honeypotReconcileLoop(ctx)    // Honeypot operator controller
-		go agent.prysmCNIReconcileLoop(ctx)    // Prysm CNI operator (zero trust redirect)
-		go agent.startAIAgentController(ctx)   // AI agent deploy/undeploy via NATS
-		go agent.startK8sResourceWatcher(ctx)  // K8s resource watcher for RAG pipeline
-		go agent.podHealthReconcileLoop(ctx)   // Pod health auto-remediation (eviction cleanup, resource resize)
+		go agent.honeypotReconcileLoop(ctx)   // Honeypot operator controller
+		go agent.prysmCNIReconcileLoop(ctx)   // Prysm CNI operator (zero trust redirect)
+		go agent.startAIAgentController(ctx)  // AI agent deploy/undeploy via NATS
+		go agent.startPluginController(ctx)   // WASM plugin desired-state reconciliation
+		go agent.startK8sResourceWatcher(ctx) // K8s resource watcher for RAG pipeline
+		go agent.podHealthReconcileLoop(ctx)  // Pod health auto-remediation (eviction cleanup, resource resize)
 	}
 
 	// Tunnel daemon: transparent mTLS proxy for zero-trust pod-to-pod encryption
@@ -198,9 +299,15 @@ func main() {
 
 	// Health/ready HTTP server + log proxy
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK); _, _ = w.Write([]byte("ok")) })
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK); _, _ = w.Write([]byte("ok")) })
-	
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
 	// mTLS certificate status endpoint
 	mux.HandleFunc("/mtls/status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -316,7 +423,10 @@ func main() {
 			http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
 		}
 	})
-	
+
+	// Action tool endpoints for AI agent tool execution via DERP
+	agent.setupToolRoutes(mux)
+
 	// Setup K8s audit webhook for dynamic audit events
 	agent.setupAuditWebhookRoutes(mux)
 
@@ -408,28 +518,121 @@ func (a *PrysmAgent) autoRegister(ctx context.Context) error {
 			continue
 		}
 
-		clusterID, ok := result["cluster_id"]
-		if !ok {
-			lastErr = fmt.Errorf("register response missing cluster_id")
-			continue
+		// Prefer public_id (stable short SHA, won't change across DB resets).
+		// Fall back to numeric cluster_id for backward compat with old backends.
+		var newClusterID string
+		if pid, ok := result["public_id"].(string); ok && pid != "" {
+			newClusterID = pid
+		} else {
+			clusterID, ok := result["cluster_id"]
+			if !ok {
+				lastErr = fmt.Errorf("register response missing cluster_id and public_id")
+				continue
+			}
+			newClusterID = fmt.Sprintf("%v", clusterID)
+			// Strip any decimal (JSON numbers decode as float64)
+			if idx := strings.Index(newClusterID, "."); idx != -1 {
+				newClusterID = newClusterID[:idx]
+			}
 		}
 
-		a.ClusterID = fmt.Sprintf("%v", clusterID)
-		// Strip any decimal (JSON numbers decode as float64)
-		if idx := strings.Index(a.ClusterID, "."); idx != -1 {
-			a.ClusterID = a.ClusterID[:idx]
+		if a.ClusterID != "" && a.ClusterID != newClusterID {
+			log.Printf("Cluster ID changed from stale %s to %s — clearing old state", a.ClusterID, newClusterID)
+			_ = os.Remove(clusterIDStateFile)
+			_ = os.Remove(agentTokenStateFile)
 		}
+		a.ClusterID = newClusterID
 
 		name, _ := result["cluster_name"].(string)
 		if name != "" {
 			a.ClusterName = name
 		}
 
+		// If backend issued a cluster-bound token, switch to it so DERP auth works.
+		if boundToken, ok := result["agent_token"].(string); ok && boundToken != "" && result["agent_token_bound"] == true {
+			if boundToken != a.AgentToken {
+				log.Printf("Switching to cluster-bound agent token issued by backend")
+				a.AgentToken = boundToken
+				if err := a.saveAgentToken(); err != nil {
+					log.Printf("Warning: failed to persist cluster-bound token: %v", err)
+				}
+			}
+		}
+
 		log.Printf("Auto-registered cluster %q (ID: %s)", a.ClusterName, a.ClusterID)
+		if err := a.saveClusterID(); err != nil {
+			log.Printf("Warning: failed to persist cluster ID: %v", err)
+		}
 		return nil
 	}
 
 	return fmt.Errorf("auto-register failed after 5 attempts: %w", lastErr)
+}
+
+const clusterIDStateFile = "/var/lib/prysm-agent/cluster_id"
+const agentTokenStateFile = "/var/lib/prysm-agent/agent_token"
+
+func (a *PrysmAgent) saveClusterID() error {
+	return os.WriteFile(clusterIDStateFile, []byte(a.ClusterID), 0600)
+}
+
+func (a *PrysmAgent) loadClusterID() (string, error) {
+	data, err := os.ReadFile(clusterIDStateFile)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func (a *PrysmAgent) saveAgentToken() error {
+	return os.WriteFile(agentTokenStateFile, []byte(a.AgentToken), 0600)
+}
+
+func (a *PrysmAgent) loadAgentToken() (string, error) {
+	data, err := os.ReadFile(agentTokenStateFile)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// fetchComponentConfig polls the backend for component image overrides.
+func (a *PrysmAgent) fetchComponentConfig(ctx context.Context) {
+	if a.BackendURL == "" || a.AgentToken == "" {
+		return
+	}
+	url := a.BackendURL + "/api/v1/agent/components/config"
+	err := retryOn5xx(ctx, 3, 2*time.Second, func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return fmt.Errorf("create request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+a.AgentToken)
+		req.Header.Set("X-Cluster-ID", a.ClusterID)
+
+		resp, err := a.HTTPClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("fetch: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("backend returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+
+		var cfg AgentComponentConfig
+		if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+			return fmt.Errorf("decode: %w", err)
+		}
+		a.ComponentConfig = cfg
+		log.Printf("component-config: fetched overrides (ebpf=%q log=%q cni=%q fluentbit=%q)",
+			cfg.EBPFImage, cfg.LogImage, cfg.CNIImage, cfg.FluentBitImage)
+		return nil
+	})
+	if err != nil {
+		log.Printf("component-config: fetch failed: %v", err)
+	}
 }
 
 func runHealthCheck() error {
@@ -465,7 +668,10 @@ func runCCProxyMode() {
 		OrganizationID: orgID,
 		derpRegion:     getEnvOrDefault("DERP_REGION", ""),
 		derpSkipVerify: getEnvOrDefault("DERP_SKIP_TLS_VERIFY", "") == "true" || getEnvOrDefault("DERP_SKIP_TLS_VERIFY", "") == "1",
-		HTTPClient:     &http.Client{Timeout: 30 * time.Second},
+		HTTPClient: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: &userAgentTransport{base: http.DefaultTransport},
+		},
 	}
 
 	if servers := getEnvOrDefault("DERP_SERVERS", getEnvOrDefault("DERP_SERVER", "")); servers != "" {
@@ -514,4 +720,16 @@ func runCCProxyMode() {
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("CC proxy server failed: %v", err)
 	}
+}
+
+// userAgentTransport wraps an http.RoundTripper to set a User-Agent header on all requests.
+type userAgentTransport struct {
+	base http.RoundTripper
+}
+
+func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "Prysm-Agent/2.5")
+	}
+	return t.base.RoundTrip(req)
 }

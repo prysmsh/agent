@@ -33,8 +33,9 @@ type crossClusterRouteAssignment struct {
 	LocalPort        int    `json:"local_port"`
 	Protocol         string `json:"protocol"`
 	Status           string `json:"status"`
+	ConnectionMethod string `json:"connection_method"`
 	Enabled          bool   `json:"enabled"`
-	Role             string `json:"role"`                // "source" or "target"
+	Role             string `json:"role"` // "source" or "target"
 	PeerClusterID    uint   `json:"peer_cluster_id"`
 	PeerDERPClientID string `json:"peer_derp_client_id"` // e.g. "cluster_5"
 }
@@ -59,10 +60,10 @@ type crossClusterRouteManager struct {
 }
 
 type sourceRoute struct {
-	assignment   crossClusterRouteAssignment
-	serviceIP    string       // ClusterIP of the K8s Service for this route
-	listener     net.Listener // TCP listener on target_port (proxy mode only)
-	cancel       context.CancelFunc
+	assignment crossClusterRouteAssignment
+	serviceIP  string       // ClusterIP of the K8s Service for this route
+	listener   net.Listener // TCP listener on target_port (proxy mode only)
+	cancel     context.CancelFunc
 }
 
 type targetRoute struct {
@@ -70,6 +71,14 @@ type targetRoute struct {
 	cancel     context.CancelFunc
 	connsMu    sync.Mutex
 	conns      map[string]net.Conn // streamID -> K8s service conn
+}
+
+type ccProxyHealthStatus struct {
+	Name    string
+	Phase   string
+	IP      string
+	Ready   bool
+	Message string
 }
 
 func newCrossClusterRouteManager(agent *PrysmAgent) *crossClusterRouteManager {
@@ -121,7 +130,12 @@ func (m *crossClusterRouteManager) reconcile(ctx context.Context) {
 		log.Printf("cross-cluster-routes: poll failed: %v", err)
 		return
 	}
+	m.reconcileFromAssignments(ctx, routes)
+}
 
+// reconcileFromAssignments reconciles the running routes with the given desired assignments.
+// This is called by the polling loop (reconcile) and by the CRD controller.
+func (m *crossClusterRouteManager) reconcileFromAssignments(ctx context.Context, routes []crossClusterRouteAssignment) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -584,6 +598,71 @@ func (m *crossClusterRouteManager) stopAll() {
 	}
 }
 
+func (m *crossClusterRouteManager) getSourceRouteServiceIP(routeID uint) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sr, ok := m.sources[routeID]; ok {
+		return sr.serviceIP
+	}
+	return ""
+}
+
+func (m *crossClusterRouteManager) getProxyHealthStatus(ctx context.Context) ccProxyHealthStatus {
+	if m.proxyMode {
+		return ccProxyHealthStatus{
+			Name:    ccProxyPodName,
+			Phase:   "ProxyMode",
+			Ready:   true,
+			Message: "running in cc-proxy mode",
+		}
+	}
+
+	cs := m.agent.clientset
+	if cs == nil {
+		return ccProxyHealthStatus{
+			Name:    ccProxyPodName,
+			Phase:   "Unknown",
+			Ready:   false,
+			Message: "kubernetes client unavailable",
+		}
+	}
+
+	ns := ccRouteAgentNamespace()
+	tCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	p, err := cs.CoreV1().Pods(ns).Get(tCtx, ccProxyPodName, metav1.GetOptions{})
+	if err != nil {
+		return ccProxyHealthStatus{
+			Name:    ccProxyPodName,
+			Phase:   "Missing",
+			Ready:   false,
+			Message: err.Error(),
+		}
+	}
+
+	status := ccProxyHealthStatus{
+		Name:  p.Name,
+		Phase: string(p.Status.Phase),
+		IP:    p.Status.PodIP,
+		Ready: isPodReady(p),
+	}
+	if !status.Ready {
+		for _, cond := range p.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status != corev1.ConditionTrue {
+				if cond.Message != "" {
+					status.Message = cond.Message
+				} else if cond.Reason != "" {
+					status.Message = cond.Reason
+				}
+				break
+			}
+		}
+	}
+
+	return status
+}
+
 // ccRouteServiceName returns the K8s Service name for a cross-cluster route.
 func ccRouteServiceName(r crossClusterRouteAssignment) string {
 	return fmt.Sprintf("cc-%s--%s", r.TargetService, r.TargetNamespace)
@@ -837,11 +916,39 @@ func (m *crossClusterRouteManager) reportStatus(routeID uint, status, connection
 
 const ccProxyPodName = "prysm-cc-proxy"
 
+func isPodReady(p *corev1.Pod) bool {
+	if p == nil {
+		return false
+	}
+	if p.Status.Phase != corev1.PodRunning || p.Status.PodIP == "" {
+		return false
+	}
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
 // ensureProxyPod creates the cross-cluster proxy pod if it doesn't exist.
 // The proxy pod runs without hostNetwork, getting a Pod IP for Endpoints.
 func (m *crossClusterRouteManager) ensureProxyPod(ctx context.Context) error {
 	if m.proxyPodRunning {
-		return nil
+		// Re-validate cached state; the proxy can be Running but unhealthy.
+		cs := m.agent.clientset
+		if cs == nil {
+			return fmt.Errorf("no kubernetes client")
+		}
+		ns := ccRouteAgentNamespace()
+		checkCtx, checkCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer checkCancel()
+		p, err := cs.CoreV1().Pods(ns).Get(checkCtx, ccProxyPodName, metav1.GetOptions{})
+		if err == nil && isPodReady(p) {
+			return nil
+		}
+		log.Printf("cross-cluster-routes: proxy pod cached as running but not ready; recreating")
+		m.proxyPodRunning = false
 	}
 
 	cs := m.agent.clientset
@@ -855,16 +962,19 @@ func (m *crossClusterRouteManager) ensureProxyPod(ctx context.Context) error {
 
 	// Check if pod already exists
 	existing, err := cs.CoreV1().Pods(ns).Get(tCtx, ccProxyPodName, metav1.GetOptions{})
-	if err == nil && existing.Status.Phase == corev1.PodRunning {
+	if err == nil && isPodReady(existing) {
 		m.proxyPodRunning = true
 		log.Printf("cross-cluster-routes: proxy pod already running (IP: %s)", existing.Status.PodIP)
 		return nil
+	}
+	if err == nil {
+		log.Printf("cross-cluster-routes: proxy pod exists but is not ready (phase=%s); recreating", existing.Status.Phase)
 	}
 
 	// Get agent image from current pod (via downward API or default)
 	agentImage := os.Getenv("AGENT_IMAGE")
 	if agentImage == "" {
-		agentImage = "172.21.0.17:5000/prysm/agent:latest" // Default for local dev
+		agentImage = "ghcr.io/prysmsh/agent:latest"
 	}
 
 	// Build environment variables for proxy pod
@@ -899,10 +1009,11 @@ func (m *crossClusterRouteManager) ensureProxyPod(ctx context.Context) error {
 			ServiceAccountName: "prysm-agent", // Reuse agent's SA
 			Containers: []corev1.Container{
 				{
-					Name:    "cc-proxy",
-					Image:   agentImage,
-					Command: []string{"./prysm-agent", "--cc-proxy"},
-					Env:     envVars,
+					Name:            "cc-proxy",
+					Image:           agentImage,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Command:         []string{"./prysm-agent", "--cc-proxy"},
+					Env:             envVars,
 					Ports: []corev1.ContainerPort{
 						{Name: "health", ContainerPort: 8081, Protocol: corev1.ProtocolTCP},
 					},
@@ -919,7 +1030,7 @@ func (m *crossClusterRouteManager) ensureProxyPod(ctx context.Context) error {
 		},
 	}
 
-	// Delete existing pod if not running (e.g., failed/pending)
+	// Delete existing pod if unhealthy/stale so we can recreate cleanly.
 	if existing != nil {
 		_ = cs.CoreV1().Pods(ns).Delete(tCtx, ccProxyPodName, metav1.DeleteOptions{})
 		time.Sleep(2 * time.Second) // Brief wait for deletion
@@ -930,7 +1041,7 @@ func (m *crossClusterRouteManager) ensureProxyPod(ctx context.Context) error {
 		return fmt.Errorf("create proxy pod: %w", err)
 	}
 
-	// Wait for pod to be running (use parent context, not the short tCtx)
+	// Wait for pod to be ready (use parent context, not the short tCtx)
 	log.Printf("cross-cluster-routes: waiting for proxy pod to start...")
 	for i := 0; i < 30; i++ {
 		time.Sleep(2 * time.Second)
@@ -940,7 +1051,7 @@ func (m *crossClusterRouteManager) ensureProxyPod(ctx context.Context) error {
 		if err != nil {
 			continue
 		}
-		if p.Status.Phase == corev1.PodRunning && p.Status.PodIP != "" {
+		if isPodReady(p) {
 			m.proxyPodRunning = true
 			log.Printf("cross-cluster-routes: proxy pod running (IP: %s)", p.Status.PodIP)
 			return nil

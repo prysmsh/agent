@@ -4,6 +4,7 @@ This update addresses the following vulnerabilities in the prysm-agent container
 
 ## Fixed CVEs
 
+### Container / base image
 | CVE ID | Severity | Component | Fix |
 |--------|----------|-----------|-----|
 | CVE-2024-25621 | HIGH | runc | Updated base image to Alpine 3.21 |
@@ -14,19 +15,32 @@ This update addresses the following vulnerabilities in the prysm-agent container
 | CVE-2024-23653 | CRITICAL | moby/buildkit | Not included in agent (false positive) |
 | CVE-2024-23652 | CRITICAL | moby/buildkit | Not included in agent (false positive) |
 
+### Go standard library and golang.org/x (Feb 2026)
+| CVE ID | Severity | Component | Fix |
+|--------|----------|-----------|-----|
+| CVE-2025-58187 / CVE-2025-61726 | MEDIUM/HIGH | net/url (query param parsing) | Go 1.26.0 |
+| CVE-2025-58188 | MEDIUM | crypto/x509 (name constraints) | Go 1.26.0 |
+| CVE-2025-61724 | MEDIUM | net/textproto (ReadResponse CPU) | Go 1.26.0 |
+| CVE-2025-58189 | MEDIUM | crypto/tls (ALPN error info) | Go 1.26.0 |
+| CVE-2025-61725 | MEDIUM | net/mail (ParseAddress CPU) | Go 1.26.0 |
+| CVE-2025-61727 | MEDIUM | crypto/x509 (wildcard SANs) | Go 1.26.0 |
+| CVE-2025-61723 | MEDIUM | encoding/pem (quadratic parsing) | Go 1.26.0 |
+| CVE-2025-22870 | MEDIUM | golang.org/x/net (HTTP proxy bypass, IPv6 zone) | golang.org/x/net v0.50.1 |
+| CVE-2025-61728 | HIGH | archive/zip (archive index CPU) | Go 1.26.0 |
+| CVE-2025-61729 | HIGH | crypto/x509 (crafted cert DoS) | Go 1.26.0 |
+
 ## Changes Made
 
 ### 1. Updated Dockerfile
 - Changed from `alpine:latest` to pinned `alpine:3.21` (latest stable with security patches)
-- Changed builder from `golang:1.24-alpine` to `golang:1.24-alpine3.21`
+- Builder image: `golang:1.26.0-alpine` (Go 1.26.0 for stdlib CVE fixes)
 - Added kubectl version pinning and checksum verification
 - Added security hardening flags to Go build (`-ldflags="-s -w"`, `-trimpath`)
 
 ### 2. Updated Go Dependencies
-- Updated `golang.org/x/crypto` from v0.41.0 to v0.47.0
-- Updated `golang.org/x/net` from v0.43.0 to v0.49.0
-- Updated `golang.org/x/sys` from v0.35.0 to v0.40.0
-- Updated `golang.org/x/term` and `golang.org/x/text` to latest versions
+- Go toolchain: **1.26.0** (stdlib fixes for net/url, crypto/x509, crypto/tls, encoding/pem, net/mail, net/textproto, archive/zip).
+- Updated `golang.org/x/net` to **v0.50.1** (CVE-2025-22870 HTTP proxy bypass via IPv6 Zone IDs).
+- Previously: `golang.org/x/crypto` v0.47.0, `golang.org/x/sys` v0.40.0, etc.
 
 ### 3. Added Distroless Option
 Created `Dockerfile.distroless` which:
@@ -48,12 +62,12 @@ Created `.github/workflows/security-scan.yml` to:
 
 ### Standard Alpine-based image:
 ```bash
-docker build -t beehivesec/prysm-agent:secure -f Dockerfile .
+docker build -t ghcr.io/prysmsh/agent:secure -f Dockerfile .
 ```
 
 ### Distroless image (recommended for production):
 ```bash
-docker build -t beehivesec/prysm-agent:distroless -f Dockerfile.distroless .
+docker build -t ghcr.io/prysmsh/agent:distroless -f Dockerfile.distroless .
 ```
 
 ## Verification
@@ -67,7 +81,7 @@ brew install trivy  # macOS
 apt-get install trivy  # Debian/Ubuntu
 
 # Scan the image
-trivy image beehivesec/prysm-agent:secure
+trivy image ghcr.io/prysmsh/agent:secure
 
 # Expected: 0 CRITICAL, 0 HIGH vulnerabilities
 ```
@@ -79,7 +93,7 @@ To use the updated image in Kubernetes:
 ```bash
 helm upgrade prysm-agent prysm/agent \
   --namespace prysm-system \
-  --set image.repository=beehivesec/prysm-agent \
+  --set image.repository=ghcr.io/prysmsh/agent \
   --set image.tag=secure \
   --reuse-values
 ```
@@ -89,7 +103,7 @@ Or for distroless:
 ```bash
 helm upgrade prysm-agent prysm/agent \
   --namespace prysm-system \
-  --set image.repository=beehivesec/prysm-agent \
+  --set image.repository=ghcr.io/prysmsh/agent \
   --set image.tag=distroless \
   --reuse-values
 ```

@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prysmsh/pkg/certutil"
 	"github.com/prysmsh/pkg/tlsutil"
 )
 
@@ -55,20 +57,28 @@ type MTLSClient struct {
 	tlsConfig  *tls.Config
 	httpClient *http.Client
 
+	// PQC key material to embed in certificate requests.
+	kemPublicKey  []byte // marshaled pqc.HybridPublicKey
+	signingPubKey []byte // marshaled sign.HybridPublicKey
+
 	certPath string
 	mu       sync.RWMutex
 }
 
 // CertificateRequest is the bootstrap request format
 type CertificateRequest struct {
-	BootstrapToken string `json:"bootstrap_token"`
-	CSR            string `json:"csr"`
-	ClusterID      string `json:"cluster_id"`
+	BootstrapToken  string `json:"bootstrap_token"`
+	CSR             string `json:"csr"`
+	ClusterID       string `json:"cluster_id"`
+	KEMPublicKey    string `json:"kem_public_key,omitempty"`
+	SigningPublicKey string `json:"signing_public_key,omitempty"`
 }
 
 // RenewalRequest is the certificate renewal request format
 type RenewalRequest struct {
-	CSR string `json:"csr"`
+	CSR             string `json:"csr"`
+	KEMPublicKey    string `json:"kem_public_key,omitempty"`
+	SigningPublicKey string `json:"signing_public_key,omitempty"`
 }
 
 // CertificateResponse is the response from certificate issuance
@@ -92,6 +102,12 @@ func NewMTLSClient(controlPlaneURL, clusterID string) *MTLSClient {
 		clusterID:       clusterID,
 		certPath:        certPath,
 	}
+}
+
+// SetPQCKeys sets the PQC public keys to include in certificate requests.
+func (c *MTLSClient) SetPQCKeys(kemPub, sigPub []byte) {
+	c.kemPublicKey = kemPub
+	c.signingPubKey = sigPub
 }
 
 // Initialize loads existing certificates or bootstraps new ones
@@ -278,6 +294,12 @@ func (c *MTLSClient) bootstrap(ctx context.Context) error {
 		CSR:            string(csrPEM),
 		ClusterID:      c.clusterID,
 	}
+	if len(c.kemPublicKey) > 0 {
+		req.KEMPublicKey = base64.StdEncoding.EncodeToString(c.kemPublicKey)
+	}
+	if len(c.signingPubKey) > 0 {
+		req.SigningPublicKey = base64.StdEncoding.EncodeToString(c.signingPubKey)
+	}
 
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -351,7 +373,12 @@ func (c *MTLSClient) bootstrap(ctx context.Context) error {
 		return fmt.Errorf("failed to setup TLS config: %w", err)
 	}
 
-	log.Printf("✅ mTLS certificate issued (serial: %s, expires: %s)",
+	// Verify PQC signature if present on the received certificate.
+	if _, err := certutil.VerifyPQC(c.cert, nil); err == nil {
+		log.Println("PQC signature on certificate verified successfully")
+	}
+
+	log.Printf("mTLS certificate issued (serial: %s, expires: %s)",
 		certResp.SerialNumber, certResp.NotAfter.Format(time.RFC3339))
 
 	return nil
@@ -444,6 +471,12 @@ func (c *MTLSClient) Renew(ctx context.Context) error {
 	req := RenewalRequest{
 		CSR: string(csrPEM),
 	}
+	if len(c.kemPublicKey) > 0 {
+		req.KEMPublicKey = base64.StdEncoding.EncodeToString(c.kemPublicKey)
+	}
+	if len(c.signingPubKey) > 0 {
+		req.SigningPublicKey = base64.StdEncoding.EncodeToString(c.signingPubKey)
+	}
 
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -504,7 +537,12 @@ func (c *MTLSClient) Renew(ctx context.Context) error {
 		return fmt.Errorf("failed to setup TLS config: %w", err)
 	}
 
-	log.Printf("✅ mTLS certificate renewed (serial: %s, expires: %s)",
+	// Verify PQC signature if present on the renewed certificate.
+	if _, err := certutil.VerifyPQC(c.cert, nil); err == nil {
+		log.Println("PQC signature on renewed certificate verified successfully")
+	}
+
+	log.Printf("mTLS certificate renewed (serial: %s, expires: %s)",
 		certResp.SerialNumber, certResp.NotAfter.Format(time.RFC3339))
 
 	return nil

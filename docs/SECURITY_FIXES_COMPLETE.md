@@ -90,8 +90,8 @@ brew install trivy  # macOS
 apt-get install trivy  # Debian/Ubuntu
 
 # Scan images
-trivy image --severity CRITICAL,HIGH beehivesec/prysm-agent:latest
-trivy image --severity CRITICAL,HIGH beehivesec/prysm-agent:distroless
+trivy image --severity CRITICAL,HIGH ghcr.io/prysmsh/agent:latest
+trivy image --severity CRITICAL,HIGH ghcr.io/prysmsh/agent:distroless
 
 # Expected: 0 CRITICAL, 0-2 HIGH (only Alpine base image issues in standard variant)
 # Expected: 0 CRITICAL, 0 HIGH (distroless variant)
@@ -103,7 +103,7 @@ trivy image --severity CRITICAL,HIGH beehivesec/prysm-agent:distroless
 ```bash
 helm upgrade prysm-agent prysm/agent \
   --namespace prysm-system \
-  --set image.repository=beehivesec/prysm-agent \
+  --set image.repository=ghcr.io/prysmsh/agent \
   --set image.tag=distroless \
   --reuse-values
 ```
@@ -112,7 +112,7 @@ helm upgrade prysm-agent prysm/agent \
 ```bash
 helm upgrade prysm-agent prysm/agent \
   --namespace prysm-system \
-  --set image.repository=beehivesec/prysm-agent \
+  --set image.repository=ghcr.io/prysmsh/agent \
   --set image.tag=latest \
   --reuse-values
 ```

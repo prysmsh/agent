@@ -1,21 +1,28 @@
-FROM golang:1.24-alpine3.21 AS builder
+ARG GO_VERSION=1.26
+FROM golang:${GO_VERSION}-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git
 
 WORKDIR /app
 
-# Copy go mod files and local pkg module (use prysmsh-pkg to avoid clashing with agent's pkg/)
+# Copy go mod files and local pkg module (use prysm-pkg to avoid clashing with agent's pkg/)
 COPY prysm-agent/go.mod prysm-agent/go.sum ./
-COPY pkg/ ./prysmsh-pkg/
+COPY pkg/ ./prysm-pkg/
 
 # Copy source code
 COPY prysm-agent/ .
 
-# Use local pkg module (avoids fetching from network; pkg is in the same repo)
-RUN echo 'replace github.com/prysmsh/pkg => ./prysmsh-pkg' >> go.mod
+# Use local pkg module (avoids fetching from network; pkg is in the same repo).
+# pqc and tlsutil are separate Go modules on the registry but plain packages
+# locally, so we create stub go.mod files and add replace directives for all three.
+RUN printf 'module github.com/prysmsh/pkg/pqc\ngo 1.26.0\n' > ./prysm-pkg/pqc/go.mod \
+    && printf 'module github.com/prysmsh/pkg/tlsutil\ngo 1.26.0\n' > ./prysm-pkg/tlsutil/go.mod \
+    && printf '\nreplace github.com/prysmsh/pkg => ./prysm-pkg\nreplace github.com/prysmsh/pkg/pqc => ./prysm-pkg/pqc\nreplace github.com/prysmsh/pkg/tlsutil => ./prysm-pkg/tlsutil\n' >> go.mod
 
 RUN go mod download
+# Ensure go.sum has all transitive deps (needed when using replace with local pkg)
+RUN go get ./cmd/agent
 
 # Build the agent binary with security hardening
 RUN CGO_ENABLED=0 GOOS=linux go build \
@@ -46,8 +53,16 @@ RUN KUBECTL_VERSION="v1.32.0" && \
     && rm kubectl.sha256
 
 # Install Trivy for container vulnerability scanning
-RUN TRIVY_VERSION="0.58.2" && \
-    curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v${TRIVY_VERSION}
+RUN TRIVY_VERSION="0.69.1" && \
+    TRIVY_OS="Linux" && \
+    TRIVY_ARCH="64bit" && \
+    TRIVY_TARBALL="trivy_${TRIVY_VERSION}_${TRIVY_OS}-${TRIVY_ARCH}.tar.gz" && \
+    curl -fsSL -o /tmp/trivy.tar.gz "https://get.trivy.dev/trivy?os=${TRIVY_OS}&arch=${TRIVY_ARCH}&version=${TRIVY_VERSION}&type=tar.gz&client=docker-build" && \
+    curl -fsSL -o /tmp/trivy_checksums.txt "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt" && \
+    grep "${TRIVY_TARBALL}" /tmp/trivy_checksums.txt | awk '{print $1 "  /tmp/trivy.tar.gz"}' | sha256sum -c - && \
+    tar -xzf /tmp/trivy.tar.gz -C /tmp trivy && \
+    install /tmp/trivy /usr/local/bin/trivy && \
+    rm -f /tmp/trivy /tmp/trivy.tar.gz /tmp/trivy_checksums.txt
 
 # Create non-root user
 RUN addgroup -g 1001 prysm \
@@ -69,7 +84,6 @@ COPY prysm-agent/config/ ./config/
 
 # Set up environment
 ENV CLUSTER_ID=""
-ENV AGENT_TOKEN=""
 ENV ORGANIZATION_ID=1
 ENV BACKEND_URL="http://kubeaccess-backend:8080"
 ENV REGION="us-east-1"

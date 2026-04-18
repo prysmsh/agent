@@ -14,21 +14,113 @@ kind: ClusterRole
 metadata:
   name: prysm-agent
 rules:
+# Core API
 - apiGroups: [""]
-  resources: ["*"]
-  verbs: ["*"]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+# namespaces: create is unrestricted (K8s limitation); get locked to prysm-* namespaces
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["list", "create"]
+- apiGroups: [""]
+  resources: ["namespaces"]
+  resourceNames: ["prysm-system", "prysm-logging", "prysm-honeypots", "prysm-ai-agents", "kubeaccess-system"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "create", "update", "delete"]
+- apiGroups: [""]
+  resources: ["endpoints"]
+  verbs: ["get"]
+# secrets and serviceaccounts/token are scoped to per-namespace Roles below (not cluster-wide)
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update", "delete"]
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  verbs: ["create", "delete"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["list"]
+# Apps API
 - apiGroups: ["apps"]
-  resources: ["*"]
-  verbs: ["*"]
-- apiGroups: ["extensions"]
-  resources: ["*"]
-  verbs: ["*"]
-- apiGroups: ["networking.k8s.io"]
-  resources: ["*"]
-  verbs: ["*"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "create", "update", "delete"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "create", "update", "delete"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get"]
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "list"]
+# RBAC — agent self-provisions roles for sub-components
+# create is unrestricted (K8s limitation) but escalation-check prevents granting perms agent doesn't have
+# update locked to the exact named resources the agent manages
 - apiGroups: ["rbac.authorization.k8s.io"]
-  resources: ["*"]
-  verbs: ["*"]
+  resources: ["clusterroles"]
+  verbs: ["list", "create"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles"]
+  resourceNames: ["prysm-agent", "prysm-agent-crd", "prysm-cni", "prysm-honeypot-clusterrole"]
+  verbs: ["get", "update"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterrolebindings"]
+  verbs: ["list", "create"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterrolebindings"]
+  resourceNames: ["prysm-agent", "prysm-agent-crd", "prysm-cni", "prysm-honeypot-clusterrolebinding"]
+  verbs: ["get", "update"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["roles"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["rolebindings"]
+  verbs: ["get", "list", "create", "delete"]
+# Networking
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "list", "create", "update", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list"]
+# Autoscaling — read-only for telemetry
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+# Metrics API
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+# CRD management — create is unrestricted (K8s doesn't support resourceNames on create)
+# get/update/list are locked to only prysm-owned CRDs
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["create", "list"]
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  resourceNames:
+  - "crossclusterroutes.prysm.sh"
+  - "clustertunnels.prysm.sh"
+  verbs: ["get", "update"]
+# CrossClusterRoute CRs
+- apiGroups: ["prysm.sh"]
+  resources: ["crossclusterroutes"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["prysm.sh"]
+  resources: ["crossclusterroutes/status"]
+  verbs: ["get", "update", "patch"]
+# ClusterTunnel CRs
+- apiGroups: ["prysm.sh"]
+  resources: ["clustertunnels"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["prysm.sh"]
+  resources: ["clustertunnels/status"]
+  verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -38,6 +130,113 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: prysm-agent
+subjects:
+- kind: ServiceAccount
+  name: prysm-agent
+  namespace: kubeaccess-system
+# ---------------------------------------------------------------------------
+# Namespace-scoped Roles: secrets (write) and serviceaccounts/token (create)
+# These replace the former cluster-wide permissions for those resources.
+# The SA lives in kubeaccess-system but can be bound to roles in other namespaces.
+# ---------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prysm-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prysm-agent-secrets
+  namespace: prysm-system
+  labels:
+    app.kubernetes.io/managed-by: prysm-agent
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "update", "delete"]
+- apiGroups: [""]
+  resources: ["serviceaccounts/token"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prysm-agent-secrets
+  namespace: prysm-system
+  labels:
+    app.kubernetes.io/managed-by: prysm-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prysm-agent-secrets
+subjects:
+- kind: ServiceAccount
+  name: prysm-agent
+  namespace: kubeaccess-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prysm-logging
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prysm-agent-secrets
+  namespace: prysm-logging
+  labels:
+    app.kubernetes.io/managed-by: prysm-agent
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prysm-agent-secrets
+  namespace: prysm-logging
+  labels:
+    app.kubernetes.io/managed-by: prysm-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prysm-agent-secrets
+subjects:
+- kind: ServiceAccount
+  name: prysm-agent
+  namespace: kubeaccess-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prysm-honeypots
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prysm-agent-secrets
+  namespace: prysm-honeypots
+  labels:
+    app.kubernetes.io/managed-by: prysm-agent
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prysm-agent-secrets
+  namespace: prysm-honeypots
+  labels:
+    app.kubernetes.io/managed-by: prysm-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prysm-agent-secrets
 subjects:
 - kind: ServiceAccount
   name: prysm-agent
@@ -133,9 +332,6 @@ spec:
         - name: modules
           mountPath: /lib/modules
           readOnly: true
-        - name: kubeconfig
-          mountPath: /root/.kube
-          readOnly: true
         - name: tunnel-pods
           mountPath: /var/run/prysm
         ports:
@@ -159,10 +355,10 @@ spec:
           periodSeconds: 10
         resources:
           requests:
-            memory: "64Mi"
+            memory: "128Mi"
             cpu: "100m"
           limits:
-            memory: "256Mi"
+            memory: "512Mi"
             cpu: "500m"
       volumes:
       - name: wireguard-config
@@ -177,10 +373,6 @@ spec:
         hostPath:
           path: /lib/modules
           type: Directory
-      - name: kubeconfig
-        hostPath:
-          path: /etc/kubernetes/admin.conf
-          type: File
       tolerations:
       - operator: Exists
         effect: NoSchedule

@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -37,6 +38,15 @@ func (a *PrysmAgent) initKubernetesClients() error {
 		return err
 	}
 
+	// When KUBECONFIG_APISERVER is set to a reachable URL, the backend can use it for direct cluster proxy (e.g. dev/docker).
+	if override := strings.TrimSpace(getEnvOrDefault("KUBECONFIG_APISERVER", "")); override != "" {
+		u := strings.TrimRight(override, "/")
+		// Do not send in-cluster default; backend cannot reach kubernetes.default.svc
+		if !strings.Contains(u, "kubernetes.default.svc") {
+			a.apiServerURL = u
+		}
+	}
+
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return fmt.Errorf("create kubernetes client: %w", err)
@@ -52,7 +62,13 @@ func (a *PrysmAgent) initKubernetesClients() error {
 		log.Printf("Warning: discovery client initialization failed: %v", err)
 	}
 
+	dynClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		log.Printf("Warning: dynamic client initialization failed: %v", err)
+	}
+
 	a.clientset = clientset
+	a.dynamicClient = dynClient
 	a.metricsClient = metricsClient
 	a.discoveryConn = discoveryClient
 
@@ -124,7 +140,11 @@ func (a *PrysmAgent) publishClusterTelemetry(parent context.Context) {
 		return
 	}
 
-	if err := a.sendClusterSnapshot(ctx, snapshot); err != nil {
+	if err := retryOn5xx(parent, 3, 2*time.Second, func() error {
+		attemptCtx, attemptCancel := context.WithTimeout(parent, 20*time.Second)
+		defer attemptCancel()
+		return a.sendClusterSnapshot(attemptCtx, snapshot)
+	}); err != nil {
 		log.Printf("Failed to publish cluster telemetry: %v", err)
 		return
 	}
@@ -150,6 +170,10 @@ func (a *PrysmAgent) collectClusterSnapshot(ctx context.Context) (*clusterSnapsh
 	// When DERP is enabled, cluster proxy should use DERP tunnel (SaaS / private clusters)
 	if len(a.derpServers) > 0 {
 		info["use_derp"] = true
+	}
+	// Reachable API server URL for backend direct proxy (when agent runs with KUBECONFIG_APISERVER, e.g. docker-compose)
+	if a.apiServerURL != "" {
+		info["api_server"] = a.apiServerURL
 	}
 
 	nodes, err := a.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
@@ -215,12 +239,29 @@ func (a *PrysmAgent) collectClusterSnapshot(ctx context.Context) (*clusterSnapsh
 	if len(services.Items) > 0 {
 		byNamespace := map[string]int{}
 		byType := map[string]int{}
+		serviceList := make([]map[string]interface{}, 0, len(services.Items))
 		for _, svc := range services.Items {
 			byNamespace[svc.Namespace]++
 			byType[string(svc.Spec.Type)]++
+			ports := make([]map[string]interface{}, 0, len(svc.Spec.Ports))
+			for _, p := range svc.Spec.Ports {
+				ports = append(ports, map[string]interface{}{
+					"name":        p.Name,
+					"port":        p.Port,
+					"target_port": p.TargetPort.String(),
+					"protocol":    string(p.Protocol),
+				})
+			}
+			serviceList = append(serviceList, map[string]interface{}{
+				"name":      svc.Name,
+				"namespace": svc.Namespace,
+				"type":      string(svc.Spec.Type),
+				"ports":     ports,
+			})
 		}
 		serviceSummary["by_namespace"] = byNamespace
 		serviceSummary["by_type"] = byType
+		serviceSummary["list"] = serviceList
 	}
 
 	if a.discoveryConn != nil {

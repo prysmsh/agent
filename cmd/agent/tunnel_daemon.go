@@ -178,7 +178,7 @@ func newTunnelDaemon(agent *PrysmAgent) *tunnelDaemon {
 	tlsInsp := NewTLSFingerprintInspector()
 	repInsp := NewReputationInspector()
 
-	// Build multi-inspector chain: signatures → HTTP → DNS → DLP → rate → TLS → reputation
+	// Build multi-inspector chain: signatures → HTTP → DNS → DLP → rate → TLS → reputation → WASM plugins
 	inspector := NewMultiInspector(
 		sigScanner,
 		httpInspector,
@@ -187,6 +187,7 @@ func newTunnelDaemon(agent *PrysmAgent) *tunnelDaemon {
 		rateInsp,
 		tlsInsp,
 		repInsp,
+		&WasmPacketInspector{},
 	)
 
 	// Signature loader for hot-reloadable YAML signatures
@@ -275,7 +276,7 @@ func (t *tunnelDaemon) Start(ctx context.Context) error {
 	}
 	if t.repInspector != nil {
 		if t.agent.BackendURL != "" {
-			t.repInspector.SetBackendConfig(t.agent.BackendURL, t.agent.ClusterID, t.agent.HTTPClient)
+			t.repInspector.SetBackendConfig(t.agent.BackendURL, t.agent.ClusterID, t.agent.AgentToken, t.agent.HTTPClient)
 		}
 		t.repInspector.Start()
 	}
@@ -738,9 +739,13 @@ func (t *tunnelDaemon) proxyWithContext(client, server net.Conn, srcPod, dstPod 
 		log.Printf("tunnel: DPI threat detected: %s (level=%s, category=%s, score=%d)",
 			result.Description, result.ThreatLevel.String(), result.Category, result.Score)
 
-		// Report to mesh reporter for analytics
-		if t.meshReporter != nil && srcPod != nil {
-			t.meshReporter.RecordThreat(srcPod.Namespace, srcPod.Name, result)
+		// Report to mesh reporter for analytics (use "unknown" when pod lookup failed)
+		if t.meshReporter != nil {
+			ns, pod := "unknown", "unknown"
+			if srcPod != nil {
+				ns, pod = srcPod.Namespace, srcPod.Name
+			}
+			t.meshReporter.RecordThreat(ns, pod, result)
 		}
 
 		if result.ShouldBlock {
@@ -1085,7 +1090,7 @@ func (a *PrysmAgent) dpiConfigPollLoop(ctx context.Context) {
 }
 
 func (a *PrysmAgent) fetchAndApplyDPIConfig(parent context.Context) {
-	if a.BackendURL == "" || a.ClusterID == "" {
+	if a.BackendURL == "" || a.ClusterID == "" || a.AgentToken == "" {
 		return
 	}
 
@@ -1097,6 +1102,7 @@ func (a *PrysmAgent) fetchAndApplyDPIConfig(parent context.Context) {
 	if err != nil {
 		return
 	}
+	req.Header.Set("Authorization", "Bearer "+a.AgentToken)
 	req.Header.Set("X-Cluster-ID", a.ClusterID)
 
 	resp, err := a.HTTPClient.Do(req)

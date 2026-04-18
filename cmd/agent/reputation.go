@@ -36,6 +36,7 @@ type ReputationInspector struct {
 	// Backend API config
 	backendURL string
 	clusterID  string
+	agentToken string
 	httpClient *http.Client
 
 	stats struct {
@@ -111,9 +112,10 @@ func (r *ReputationInspector) loadFromReader(reader io.Reader) error {
 }
 
 // SetBackendConfig configures backend API refresh.
-func (r *ReputationInspector) SetBackendConfig(backendURL, clusterID string, httpClient *http.Client) {
+func (r *ReputationInspector) SetBackendConfig(backendURL, clusterID, agentToken string, httpClient *http.Client) {
 	r.backendURL = backendURL
 	r.clusterID = clusterID
+	r.agentToken = agentToken
 	if httpClient != nil {
 		r.httpClient = httpClient
 	}
@@ -164,7 +166,7 @@ func (r *ReputationInspector) refreshLoop() {
 
 // fetchFromBackend fetches the reputation list from the backend API.
 func (r *ReputationInspector) fetchFromBackend() {
-	if r.backendURL == "" {
+	if r.backendURL == "" || r.agentToken == "" {
 		return
 	}
 
@@ -173,6 +175,7 @@ func (r *ReputationInspector) fetchFromBackend() {
 	if err != nil {
 		return
 	}
+	req.Header.Set("Authorization", "Bearer "+r.agentToken)
 	if r.clusterID != "" {
 		req.Header.Set("X-Cluster-ID", r.clusterID)
 	}

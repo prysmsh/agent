@@ -31,7 +31,7 @@ const (
 	prysmCNIReconcileKey    = "PRYSM_CNI_RECONCILE_INTERVAL"
 	prysmCNIEnabledKey      = "PRYSM_CNI_ENABLED"
 	prysmCNIImageEnvKey     = "PRYSM_CNI_IMAGE"
-	defaultPrysmCNIImage    = "beehivesec/prysm-cni:latest"
+	defaultPrysmCNIImage    = "ghcr.io/prysmsh/cni:latest"
 	defaultTargetPort       = "15001"
 	defaultExcludeNamespaces = "kube-system,kube-public,prysm-system,prysm-logging,prysm-honeypots"
 
@@ -149,12 +149,17 @@ func (a *PrysmAgent) reconcilePrysmCNI(ctx context.Context) {
 // getPrysmCNIConfig fetches config from backend when available, falls back to env vars
 func (a *PrysmAgent) getPrysmCNIConfig(ctx context.Context) *PrysmCNIConfig {
 	// Start with env-based defaults
+	cniImage := getEnvOrDefault(prysmCNIImageEnvKey, defaultPrysmCNIImage)
+	// Prefer backend-pushed override from component config
+	if a.ComponentConfig.CNIImage != "" {
+		cniImage = a.ComponentConfig.CNIImage
+	}
 	config := &PrysmCNIConfig{
 		Enabled:           os.Getenv(prysmCNIEnabledKey) == "true" || os.Getenv(prysmCNIEnabledKey) == "1",
 		TargetPort:        getEnvOrDefault("PRYSM_CNI_TARGET_PORT", defaultTargetPort),
 		ExcludeNamespaces: strings.Split(getEnvOrDefault("PRYSM_CNI_EXCLUDE_NAMESPACES", defaultExcludeNamespaces), ","),
 		ExcludeCIDR:       getEnvOrDefault("PRYSM_CNI_EXCLUDE_CIDR", ""),
-		Image:             getEnvOrDefault(prysmCNIImageEnvKey, defaultPrysmCNIImage),
+		Image:             cniImage,
 	}
 
 	// Fetch from backend when available; backend config overrides env
@@ -371,7 +376,7 @@ func (a *PrysmAgent) deployPrysmCNI(ctx context.Context, config *PrysmCNIConfig)
 						{
 							Name:            "install-cni",
 							Image:           image,
-							ImagePullPolicy: corev1.PullAlways,
+							ImagePullPolicy: corev1.PullIfNotPresent,
 							Command:         []string{"/install-cni.sh"},
 							Env: []corev1.EnvVar{
 								{
@@ -443,7 +448,18 @@ func (a *PrysmAgent) deployPrysmCNI(ctx context.Context, config *PrysmCNIConfig)
 
 	_, err = a.clientset.AppsV1().DaemonSets(prysmCNINamespace).Create(ctx, ds, metav1.CreateOptions{})
 	if errors.IsAlreadyExists(err) {
+		// Get the existing DaemonSet to obtain resourceVersion for update
+		existing, getErr := a.clientset.AppsV1().DaemonSets(prysmCNINamespace).Get(ctx, prysmCNIDaemonSetName, metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("get existing CNI DaemonSet: %w", getErr)
+		}
+		ds.ObjectMeta.ResourceVersion = existing.ObjectMeta.ResourceVersion
+		ds.ObjectMeta.UID = existing.ObjectMeta.UID
 		_, err = a.clientset.AppsV1().DaemonSets(prysmCNINamespace).Update(ctx, ds, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("update CNI DaemonSet: %w", err)
+		}
+		log.Printf("Prysm CNI DaemonSet updated (image=%s)", image)
 	}
 
 	return err

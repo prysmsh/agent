@@ -113,7 +113,7 @@ When auditors question these CVEs, provide:
 Trivy sometimes reports build dependencies. To see only runtime dependencies:
 
 ```bash
-trivy image --skip-dirs /var/lib/apt,/var/cache beehivesec/prysm-agent:latest
+trivy image --skip-dirs /var/lib/apt,/var/cache ghcr.io/prysmsh/agent:latest
 ```
 
 ### Grype
@@ -123,7 +123,7 @@ Grype may cache old scan results. Clear cache:
 ```bash
 grype db delete
 grype db update
-grype beehivesec/prysm-agent:latest
+grype ghcr.io/prysmsh/agent:latest
 ```
 
 ### Snyk
@@ -131,7 +131,7 @@ grype beehivesec/prysm-agent:latest
 Snyk can scan both Dockerfile and final image. Ensure you're scanning the image, not the Dockerfile:
 
 ```bash
-snyk container test beehivesec/prysm-agent:latest
+snyk container test ghcr.io/prysmsh/agent:latest
 ```
 
 ## Contact

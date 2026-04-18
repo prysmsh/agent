@@ -1,22 +1,21 @@
 module prysm-agent
 
-go 1.24.0
-
-toolchain go1.24.3
+go 1.26.0
 
 require (
-	github.com/fsnotify/fsnotify v1.8.0
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/nats-io/nats.go v1.48.0
 	github.com/prometheus/client_golang v1.23.2
-	github.com/prysmsh/pkg/pqc v0.1.0
-	github.com/prysmsh/pkg/tlsutil v0.1.0
+	github.com/prysmsh/pkg v0.1.3
 	github.com/sirupsen/logrus v1.9.3
+	github.com/tetratelabs/wazero v1.11.0
 	github.com/vishvananda/netns v0.0.4
-	golang.org/x/crypto v0.47.0
-	golang.org/x/sys v0.40.0
+	golang.org/x/crypto v0.48.0
+	golang.org/x/sys v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.34.1
+	k8s.io/apiextensions-apiserver v0.34.1
 	k8s.io/apimachinery v0.34.1
 	k8s.io/client-go v0.34.1
 	k8s.io/metrics v0.34.1
@@ -56,12 +55,12 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/net v0.48.0 // indirect
+	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
-	golang.org/x/term v0.39.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
+	golang.org/x/term v0.40.0 // indirect
+	golang.org/x/text v0.34.0 // indirect
 	golang.org/x/time v0.13.0 // indirect
-	google.golang.org/protobuf v1.36.9 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.12.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect

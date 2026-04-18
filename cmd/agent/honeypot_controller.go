@@ -39,7 +39,8 @@ const (
 	heraldingConfigKey         = "heralding.yml"
 	honeypotReconcileEnvKey      = "HONEYPOT_RECONCILE_INTERVAL"
 	honeypotEnabledEnvKey        = "HONEYPOT_ENABLED"
-	honeypotImageRegistryEnvKey  = "HONEYPOT_IMAGE_REGISTRY"   // e.g. ghcr.io/myorg - overrides beehivesec for self-hosted
+	honeypotImageRegistryEnvKey  = "HONEYPOT_IMAGE_REGISTRY"   // e.g. ghcr.io/myorg - overrides default Prysm registry for self-hosted/air-gapped
+	defaultHoneypotImagePrefix   = "ghcr.io/prysmsh/honeypots" // Prysm registry for honeypot images
 	honeypotImagePullSecretsKey = "HONEYPOT_IMAGE_PULL_SECRET" // secret name for private registry auth
 	honeypotServiceAccount    = "prysm-honeypot-sa"
 	honeypotRole              = "prysm-honeypot-role"
@@ -89,11 +90,11 @@ var honeypotProfiles = map[string][]string{
 	"full":     {"cowrie", "dionaea", "heralding", "elasticpot", "redishoneypot", "log4pot", "wordpot", "adbhoney"},
 }
 
-// Honeypot specifications - beehivesec distroless images (docker/honeypots)
+// Honeypot specifications - Prysm images from ghcr.io/prysmsh/prysm (docker/honeypots in this repo)
 var honeypotSpecs = map[string]HoneypotSpec{
 	"cowrie": {
 		Name:          "cowrie",
-		Image:         "beehivesec/honeypot-cowrie:latest",
+		Image:         "ghcr.io/prysmsh/honeypots/cowrie:latest",
 		MemoryLimit:   "256Mi",
 		MemoryRequest: "128Mi",
 		CPULimit:      "200m",
@@ -107,7 +108,7 @@ var honeypotSpecs = map[string]HoneypotSpec{
 	},
 	"dionaea": {
 		Name:          "dionaea",
-		Image:         "beehivesec/honeypot-dionaea:latest",
+		Image:         "ghcr.io/prysmsh/honeypots/dionaea:latest",
 		MemoryLimit:   "256Mi",
 		MemoryRequest: "128Mi",
 		CPULimit:      "300m",
@@ -124,7 +125,7 @@ var honeypotSpecs = map[string]HoneypotSpec{
 	},
 	"heralding": {
 		Name:          "heralding",
-		Image:         "beehivesec/honeypot-heralding:latest",
+		Image:         "ghcr.io/prysmsh/honeypots/heralding:latest",
 		MemoryLimit:   "64Mi",
 		MemoryRequest: "32Mi",
 		CPULimit:      "100m",
@@ -140,7 +141,7 @@ var honeypotSpecs = map[string]HoneypotSpec{
 	},
 	"elasticpot": {
 		Name:          "elasticpot",
-		Image:         "beehivesec/honeypot-elasticpot:latest",
+		Image:         "ghcr.io/prysmsh/honeypots/elasticpot:latest",
 		MemoryLimit:   "64Mi",
 		MemoryRequest: "32Mi",
 		CPULimit:      "100m",
@@ -156,7 +157,7 @@ var honeypotSpecs = map[string]HoneypotSpec{
 	},
 	"redishoneypot": {
 		Name:          "redishoneypot",
-		Image:         "beehivesec/honeypot-redis:latest",
+		Image:         "ghcr.io/prysmsh/honeypots/redis:latest",
 		MemoryLimit:   "64Mi",
 		MemoryRequest: "32Mi",
 		CPULimit:      "100m",
@@ -908,15 +909,15 @@ func (a *PrysmAgent) getHoneypotImagePullSecrets() []corev1.LocalObjectReference
 	return []corev1.LocalObjectReference{{Name: name}}
 }
 
-// resolveHoneypotImage applies HONEYPOT_IMAGE_REGISTRY override for beehivesec images.
-// When set, "beehivesec/honeypot-X:tag" becomes "registry/honeypot-X:tag" for self-hosted/air-gapped clusters.
+// resolveHoneypotImage applies HONEYPOT_IMAGE_REGISTRY override for default Prysm honeypot images.
+// When set, "ghcr.io/prysmsh/honeypots/X:tag" becomes "registry/honeypot-X:tag" for self-hosted/air-gapped clusters.
 func resolveHoneypotImage(image string) string {
 	registry := strings.TrimSpace(os.Getenv(honeypotImageRegistryEnvKey))
 	if registry == "" {
 		return image
 	}
-	if strings.HasPrefix(image, "beehivesec/") {
-		return registry + "/" + strings.TrimPrefix(image, "beehivesec/")
+	if strings.HasPrefix(image, defaultHoneypotImagePrefix+"/") {
+		return registry + "/" + strings.TrimPrefix(image, defaultHoneypotImagePrefix+"/")
 	}
 	return image
 }
@@ -962,9 +963,19 @@ func (a *PrysmAgent) ensureFluentBitConfig(ctx context.Context) error {
 			agentServiceName = "prysm-agent"
 		}
 	}
-	agentHost := fmt.Sprintf("%s.%s.svc.cluster.local", agentServiceName, agentNamespace)
 	// Use AGENT_SERVICE_PORT (service port) not AGENT_HTTP_PORT (pod targetPort) when connecting via service DNS
 	agentPort := getEnvOrDefault("AGENT_SERVICE_PORT", "8080")
+
+	// Resolve the agent service ClusterIP for the fluent-bit output target.
+	// Fluent-bit's distroless image lacks NSS libraries so DNS resolution fails
+	// even with net.dns.resolver=LEGACY. Using the ClusterIP is safe because
+	// this config is re-generated on every reconciliation cycle — if the service
+	// is recreated with a new ClusterIP, the next reconcile updates the configmap.
+	agentHost := fmt.Sprintf("%s.%s.svc.cluster.local", agentServiceName, agentNamespace)
+	svc, svcErr := a.clientset.CoreV1().Services(agentNamespace).Get(ctx, agentServiceName, metav1.GetOptions{})
+	if svcErr == nil && svc.Spec.ClusterIP != "" && svc.Spec.ClusterIP != "None" {
+		agentHost = svc.Spec.ClusterIP
+	}
 
 	fluentBitConf := fmt.Sprintf(`[SERVICE]
     Flush         1
@@ -1227,9 +1238,13 @@ func (a *PrysmAgent) buildHoneypotContainer(spec HoneypotSpec) corev1.Container 
 
 // buildFluentBitSidecar creates the Fluent Bit sidecar container for log forwarding
 func (a *PrysmAgent) buildFluentBitSidecar(honeypotType string) corev1.Container {
+	fluentBitImage := "ghcr.io/prysmsh/fluent-bit:latest"
+	if a.ComponentConfig.FluentBitImage != "" {
+		fluentBitImage = a.ComponentConfig.FluentBitImage
+	}
 	return corev1.Container{
 		Name:  "fluent-bit",
-		Image: "fluent/fluent-bit:3.2",
+		Image: fluentBitImage,
 		Resources: corev1.ResourceRequirements{
 			Limits: corev1.ResourceList{
 				corev1.ResourceMemory: resource.MustParse("64Mi"),

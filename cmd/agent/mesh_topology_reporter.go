@@ -94,8 +94,18 @@ func NewMeshTopologyReporter(agent *PrysmAgent) *MeshTopologyReporter {
 
 // Start begins the background flush loop
 func (r *MeshTopologyReporter) Start(ctx context.Context) {
-	if r.agent.BackendURL == "" || r.agent.AgentToken == "" || r.agent.ClusterID == "" {
-		log.Println("mesh-topology: disabled (missing backend URL, token, or cluster ID)")
+	var missing []string
+	if r.agent.BackendURL == "" {
+		missing = append(missing, "BACKEND_URL")
+	}
+	if r.agent.AgentToken == "" {
+		missing = append(missing, "AGENT_TOKEN")
+	}
+	if r.agent.ClusterID == "" {
+		missing = append(missing, "CLUSTER_ID")
+	}
+	if len(missing) > 0 {
+		log.Printf("mesh-topology: disabled (missing: %s). Connection data will not be sent; topology will stay empty.", strings.Join(missing, ", "))
 		return
 	}
 

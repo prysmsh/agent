@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -19,12 +20,13 @@ import (
 )
 
 const (
-	ebpfCollectorNamespace    = "prysm-system"
-	ebpfCollectorName         = "prysm-ebpf-collector"
-	ebpfCollectorSecretName   = "prysm-ebpf-collector-token"
-	ebpfCollectorEnabledEnv   = "EBPF_COLLECTOR_ENABLED"
-	ebpfCollectorImageEnv     = "EBPF_COLLECTOR_IMAGE"
-	ebpfCollectorImageDefault = "ghcr.io/prysmsh/ebpf-collector:latest"
+	ebpfCollectorNamespace       = "prysm-system"
+	ebpfCollectorName            = "prysm-ebpf-collector"
+	ebpfCollectorSecretName      = "prysm-ebpf-collector-token"
+	ebpfCollectorEnabledEnv      = "EBPF_COLLECTOR_ENABLED"
+	ebpfCollectorImageEnv         = "EBPF_COLLECTOR_IMAGE"
+	ebpfCollectorImagePullSecretEnv = "EBPF_IMAGE_PULL_SECRET"
+	ebpfCollectorImageDefault    = "ghcr.io/prysmsh/ebpf-collector:latest"
 )
 
 // ensureEbpfCollectorDaemonSet creates or updates the eBPF collector DaemonSet.
@@ -73,7 +75,16 @@ func (a *PrysmAgent) ensureEbpfCollectorDaemonSet(ctx context.Context) {
 			image = ebpfCollectorImageDefault
 		}
 	}
-	ds := a.buildEbpfCollectorDaemonSet(image)
+	// Prefer backend-pushed override from component config
+	if a.ComponentConfig.EBPFImage != "" {
+		image = a.ComponentConfig.EBPFImage
+	}
+	// Normalize legacy/wrong repo path so agent always deploys the correct image
+	if strings.Contains(image, "prysmsh/prysm/ebpf-collector") {
+		image = strings.Replace(image, "prysmsh/prysm/ebpf-collector", "prysmsh/ebpf-collector", 1)
+	}
+	imagePullSecret := strings.TrimSpace(os.Getenv(ebpfCollectorImagePullSecretEnv))
+	ds := a.buildEbpfCollectorDaemonSet(image, imagePullSecret)
 
 	existing, err := a.clientset.AppsV1().DaemonSets(ebpfCollectorNamespace).Get(ctx, ebpfCollectorName, metav1.GetOptions{})
 	if err != nil {
@@ -90,21 +101,23 @@ func (a *PrysmAgent) ensureEbpfCollectorDaemonSet(ctx context.Context) {
 		return
 	}
 
-	// Reconcile: sync image, env, resources, volume mounts, volumes, security context
+	// Reconcile: sync image, imagePullPolicy, imagePullSecrets, env, resources, volume mounts, volumes, security context
 	desired := ds.Spec.Template.Spec.Containers[0]
 	existing.Spec.Template.Spec.Containers[0].Image = desired.Image
+	existing.Spec.Template.Spec.Containers[0].ImagePullPolicy = desired.ImagePullPolicy
 	existing.Spec.Template.Spec.Containers[0].Env = desired.Env
 	existing.Spec.Template.Spec.Containers[0].Resources = desired.Resources
 	existing.Spec.Template.Spec.Containers[0].VolumeMounts = desired.VolumeMounts
 	existing.Spec.Template.Spec.Containers[0].SecurityContext = desired.SecurityContext
 	existing.Spec.Template.Spec.Volumes = ds.Spec.Template.Spec.Volumes
 	existing.Spec.Template.Spec.DNSPolicy = ds.Spec.Template.Spec.DNSPolicy
+	existing.Spec.Template.Spec.ImagePullSecrets = ds.Spec.Template.Spec.ImagePullSecrets
 	if _, err := a.clientset.AppsV1().DaemonSets(ebpfCollectorNamespace).Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
 		log.Printf("ebpf-collector: failed to update DaemonSet: %v", err)
 	}
 }
 
-func (a *PrysmAgent) buildEbpfCollectorDaemonSet(image string) *appsv1.DaemonSet {
+func (a *PrysmAgent) buildEbpfCollectorDaemonSet(image string, imagePullSecretName string) *appsv1.DaemonSet {
 	privileged := true
 	runAsUser := int64(0)
 
@@ -116,6 +129,11 @@ func (a *PrysmAgent) buildEbpfCollectorDaemonSet(image string) *appsv1.DaemonSet
 		fmt.Sprintf("http://%s:%s/api/v1/agent/ztunnel/events", agentHost, agentPort))
 	meshEnabled := getEnvOrDefault("EBPF_MESH_ENABLED", "true")
 	meshCaptureAll := getEnvOrDefault("EBPF_MESH_CAPTURE_ALL", "true")
+
+	var imagePullSecrets []corev1.LocalObjectReference
+	if strings.TrimSpace(imagePullSecretName) != "" {
+		imagePullSecrets = []corev1.LocalObjectReference{{Name: strings.TrimSpace(imagePullSecretName)}}
+	}
 
 	return &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{Name: ebpfCollectorName, Namespace: ebpfCollectorNamespace},
@@ -131,6 +149,7 @@ func (a *PrysmAgent) buildEbpfCollectorDaemonSet(image string) *appsv1.DaemonSet
 					HostPID:            true,
 					HostNetwork:        true,
 					DNSPolicy:          corev1.DNSClusterFirstWithHostNet,
+					ImagePullSecrets:   imagePullSecrets,
 					NodeSelector:       map[string]string{"kubernetes.io/os": "linux"},
 					Tolerations: []corev1.Toleration{
 						{Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
@@ -139,7 +158,7 @@ func (a *PrysmAgent) buildEbpfCollectorDaemonSet(image string) *appsv1.DaemonSet
 					Containers: []corev1.Container{{
 						Name:            "ebpf-collector",
 						Image:           image,
-						ImagePullPolicy: corev1.PullAlways,
+						ImagePullPolicy: corev1.PullIfNotPresent,
 						SecurityContext: &corev1.SecurityContext{
 							Privileged: &privileged,
 							RunAsUser:  &runAsUser,

@@ -28,7 +28,7 @@ const (
 	logCollectorModeEnv     = "LOG_COLLECTOR_MODE"
 	logCollectorModeDaemon  = "daemonset"
 	logCollectorImageEnv   = "LOG_COLLECTOR_IMAGE"
-	logCollectorImageDefault = "fluent/fluent-bit:4.2"
+	logCollectorImageDefault = "ghcr.io/prysmsh/fluent-bit:4.2.2-1"
 )
 
 // ensureLogCollectorDaemonSet creates or updates the log collector DaemonSet and ConfigMap.
@@ -99,6 +99,10 @@ func (a *PrysmAgent) ensureLogCollectorDaemonSet(ctx context.Context) {
 	image := os.Getenv(logCollectorImageEnv)
 	if image == "" {
 		image = logCollectorImageDefault
+	}
+	// Prefer backend-pushed override from component config
+	if a.ComponentConfig.LogImage != "" {
+		image = a.ComponentConfig.LogImage
 	}
 	ds := a.buildLogCollectorDaemonSet(image, podCount)
 

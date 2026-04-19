@@ -19,6 +19,13 @@ const (
 	wgIfacName = "wg-prysm"
 )
 
+func shortKey(k string) string {
+	if len(k) < 16 {
+		return k
+	}
+	return k[:16]
+}
+
 type wgManager struct {
 	agent      *PrysmAgent
 	nh         *nethelperClient
@@ -43,24 +50,9 @@ type wgPeer struct {
 }
 
 func (a *PrysmAgent) startWireGuard(ctx context.Context) {
-	// Probe for nethelper socket
-	var nh *nethelperClient
+	// Always create the nethelper client; we detect availability on
+	// the first real call (iface.create) to avoid a TOCTOU race.
 	nhc := newNethelperClient()
-	if nhc.available() {
-		nh = nhc
-		log.Printf("wireguard: using nethelper daemon for privileged operations")
-	} else {
-		log.Printf("wireguard: nethelper not available, falling back to direct execution")
-		// In direct mode, check that wg and ip commands exist
-		if _, err := exec.LookPath("wg"); err != nil {
-			log.Printf("wireguard: wg command not found, skipping WireGuard setup: %v", err)
-			return
-		}
-		if _, err := exec.LookPath("ip"); err != nil {
-			log.Printf("wireguard: ip command not found, skipping WireGuard setup: %v", err)
-			return
-		}
-	}
 
 	// Read existing key pair
 	privKeyBytes, err := os.ReadFile(wgKeyPath)
@@ -76,7 +68,7 @@ func (a *PrysmAgent) startWireGuard(ctx context.Context) {
 
 	w := &wgManager{
 		agent:      a,
-		nh:         nh,
+		nh:         nhc,
 		privateKey: strings.TrimSpace(string(privKeyBytes)),
 		publicKey:  strings.TrimSpace(string(pubKeyBytes)),
 		iface:      wgIfacName,
@@ -187,10 +179,19 @@ func (w *wgManager) createInterface(cfg *wgNetworkConfig) error {
 	w.overlayIP = cfg.OverlayCIDR
 	w.listenPort = cfg.ListenPort
 
+	// Try nethelper first; fall back to direct execution on connection error.
 	if w.nh != nil {
-		if err := w.nh.ifaceCreate(w.listenPort, wgKeyPath); err != nil {
+		err := w.nh.ifaceCreate(w.listenPort, wgKeyPath)
+		if err != nil && strings.Contains(err.Error(), "connect to nethelper") {
+			log.Printf("wireguard: nethelper not reachable, falling back to direct execution")
+			w.nh = nil
+		} else if err != nil {
 			return fmt.Errorf("nethelper iface.create: %w", err)
 		}
+	}
+
+	if w.nh != nil {
+		log.Printf("wireguard: using nethelper daemon for privileged operations")
 		if err := w.nh.ifaceAddAddr(w.overlayIP); err != nil {
 			_ = w.nh.ifaceDelete()
 			return fmt.Errorf("nethelper iface.addAddr: %w", err)
@@ -201,6 +202,13 @@ func (w *wgManager) createInterface(cfg *wgNetworkConfig) error {
 		}
 	} else {
 		// Direct execution fallback
+		if _, err := exec.LookPath("wg"); err != nil {
+			return fmt.Errorf("wg command not found: %w", err)
+		}
+		if _, err := exec.LookPath("ip"); err != nil {
+			return fmt.Errorf("ip command not found: %w", err)
+		}
+
 		_ = runCmd("ip", "link", "del", w.iface)
 
 		if err := runCmd("ip", "link", "add", w.iface, "type", "wireguard"); err != nil {
@@ -233,7 +241,7 @@ func (w *wgManager) createInterface(cfg *wgNetworkConfig) error {
 	// Add initial peers
 	for _, p := range cfg.Peers {
 		if err := w.addPeer(p.PublicKey, p.Endpoint, p.AllowedIPs); err != nil {
-			log.Printf("wireguard: failed to add peer %s: %v", p.PublicKey[:16], err)
+			log.Printf("wireguard: failed to add peer %s: %v", shortKey(p.PublicKey), err)
 		}
 	}
 
@@ -258,14 +266,14 @@ func (w *wgManager) addPeer(pubKey, endpoint string, allowedIPs []string) error 
 	}
 
 	log.Printf("wireguard: added peer %s endpoint=%s allowed=%s",
-		pubKey[:16], endpoint, strings.Join(allowedIPs, ","))
+		shortKey(pubKey), endpoint, strings.Join(allowedIPs, ","))
 	return nil
 }
 
 func (w *wgManager) reconcilePeers(peers []wgPeer) error {
 	for _, p := range peers {
 		if err := w.addPeer(p.PublicKey, p.Endpoint, p.AllowedIPs); err != nil {
-			log.Printf("wireguard: reconcile peer %s failed: %v", p.PublicKey[:16], err)
+			log.Printf("wireguard: reconcile peer %s failed: %v", shortKey(p.PublicKey), err)
 		}
 	}
 	return nil

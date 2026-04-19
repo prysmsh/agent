@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync/atomic"
+	"time"
 )
 
 const nethelperSocket = "/var/run/prysm/nethelper.sock"
@@ -39,7 +40,7 @@ func newNethelperClient() *nethelperClient {
 }
 
 func (c *nethelperClient) available() bool {
-	conn, err := net.Dial("unix", c.socketPath)
+	conn, err := net.DialTimeout("unix", c.socketPath, 5*time.Second)
 	if err != nil {
 		return false
 	}
@@ -48,11 +49,13 @@ func (c *nethelperClient) available() bool {
 }
 
 func (c *nethelperClient) call(method string, params any) (json.RawMessage, error) {
-	conn, err := net.Dial("unix", c.socketPath)
+	conn, err := net.DialTimeout("unix", c.socketPath, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connect to nethelper: %w", err)
 	}
 	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	req := nhRequest{
 		JSONRPC: "2.0",

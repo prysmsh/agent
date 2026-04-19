@@ -223,8 +223,12 @@ func dispatch(req jsonRPCRequest) jsonRPCResponse {
 				return fail(-32602, "invalid allowed_ip: "+err.Error())
 			}
 		}
+		pubPrefix := p.PublicKey
+		if len(pubPrefix) > 16 {
+			pubPrefix = pubPrefix[:16]
+		}
 		log.Printf("peer.set pubkey=%s endpoint=%s allowed=%s",
-			p.PublicKey[:16], p.Endpoint, strings.Join(p.AllowedIPs, ","))
+			pubPrefix, p.Endpoint, strings.Join(p.AllowedIPs, ","))
 
 		args := []string{"set", ifaceName, "peer", p.PublicKey,
 			"allowed-ips", strings.Join(p.AllowedIPs, ","),

@@ -73,6 +73,7 @@ type PrysmAgent struct {
 	HTTPClient      *http.Client
 	BackendURL      string
 	AgentToken      string
+	AgentType       string
 	ClusterID       string
 	ClusterName     string
 	Region          string
@@ -118,6 +119,7 @@ func main() {
 	agent := &PrysmAgent{
 		BackendURL:     strings.TrimSuffix(getEnvOrDefault("BACKEND_URL", ""), "/"),
 		AgentToken:     getEnvOrDefault("AGENT_TOKEN", ""),
+		AgentType:      getEnvOrDefault("AGENT_TYPE", "kubernetes"),
 		ClusterID:      getEnvOrDefault("CLUSTER_ID", ""),
 		ClusterName:    getEnvOrDefault("CLUSTER_NAME", ""),
 		Region:         getEnvOrDefault("REGION", ""),
@@ -469,7 +471,7 @@ func (a *PrysmAgent) autoRegister(ctx context.Context) error {
 	body := map[string]interface{}{
 		"cluster_name": clusterName,
 		"agent_token":  a.AgentToken,
-		"agent_type":   "k8s-bootstrap",
+		"agent_type":   a.AgentType,
 	}
 
 	payload, err := json.Marshal(body)
@@ -664,6 +666,7 @@ func runCCProxyMode() {
 	agent := &PrysmAgent{
 		BackendURL:     strings.TrimSuffix(getEnvOrDefault("BACKEND_URL", ""), "/"),
 		AgentToken:     getEnvOrDefault("AGENT_TOKEN", ""),
+		AgentType:      getEnvOrDefault("AGENT_TYPE", "kubernetes"),
 		ClusterID:      getEnvOrDefault("CLUSTER_ID", ""),
 		OrganizationID: orgID,
 		derpRegion:     getEnvOrDefault("DERP_REGION", ""),

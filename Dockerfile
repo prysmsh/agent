@@ -62,7 +62,7 @@ RUN KUBECTL_VERSION="v1.32.0" && \
     && rm kubectl.sha256
 
 # Install Trivy for container vulnerability scanning
-RUN TRIVY_VERSION="0.69.1" && \
+RUN TRIVY_VERSION="0.70.0" && \
     TRIVY_OS="Linux" && \
     TRIVY_ARCH="64bit" && \
     TRIVY_TARBALL="trivy_${TRIVY_VERSION}_${TRIVY_OS}-${TRIVY_ARCH}.tar.gz" && \

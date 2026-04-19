@@ -32,6 +32,14 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -o prysm-agent ./cmd/agent
 
+# Build the nethelper binary
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -a \
+    -installsuffix cgo \
+    -ldflags="-s -w -extldflags '-static'" \
+    -trimpath \
+    -o prysm-nethelper ./cmd/nethelper
+
 # Final stage - use specific Alpine version for security patches
 FROM alpine:3.21
 
@@ -41,6 +49,7 @@ RUN apk add --no-cache \
     ca-certificates \
     wireguard-tools \
     iptables \
+    su-exec \
     && rm -rf /var/cache/apk/*
 
 # Install kubectl with specific version
@@ -72,15 +81,21 @@ RUN addgroup -g 1001 prysm \
 RUN mkdir -p /var/log/kubeaccess \
     /var/lib/prysm-agent \
     /app/tmp \
+    /var/run/prysm \
     && chown -R prysm:prysm /var/log/kubeaccess /var/lib/prysm-agent /app/tmp
 
 WORKDIR /app
 
 # Copy binaries from builder
 COPY --from=builder /app/prysm-agent .
+COPY --from=builder /app/prysm-nethelper .
 
 # Copy configuration templates
 COPY prysm-agent/config/ ./config/
+
+# Copy entrypoint
+COPY prysm-agent/entrypoint.sh .
+RUN chmod +x entrypoint.sh
 
 # Set up environment
 ENV CLUSTER_ID=""
@@ -103,9 +118,6 @@ ENV LOG_COLLECTION_INTERVAL=30s
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD pgrep prysm-agent >/dev/null || exit 1
 
-# Switch to non-root user for security
-USER prysm
-
 EXPOSE 8080
 
-CMD ["./prysm-agent"]
+ENTRYPOINT ["./entrypoint.sh"]

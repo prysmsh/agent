@@ -1,5 +1,6 @@
 # Build output
 /agent
+/nethelper
 /bin/
 *.exe
 

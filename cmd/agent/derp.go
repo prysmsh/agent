@@ -110,6 +110,9 @@ type derpManager struct {
 	meshRoutesCache    map[int]struct{ ServiceName string; ServicePort int }
 	meshRouteSlugCache map[string]struct{ ServiceName string; ServicePort int }
 	meshRoutesAt       time.Time
+
+	// WireGuard-over-DERP bridge for CLI peers
+	wgBridge *wgDERPBridge
 }
 
 type derpMessage struct {
@@ -498,9 +501,30 @@ func (m *derpManager) handleMessage(msg *derpMessage) {
 		if m.agent.ccRouteManager != nil {
 			m.agent.ccRouteManager.handleCrossClusterClose(msg)
 		}
+	case "wg_packet":
+		m.handleWGPacket(msg)
 	default:
 		log.Printf("DERP message type=%s size=%d bytes", msg.Type, len(msg.Data))
 	}
+}
+
+func (m *derpManager) handleWGPacket(msg *derpMessage) {
+	if m.wgBridge == nil {
+		return
+	}
+	var payload struct {
+		Packet string `json:"packet"`
+	}
+	if err := json.Unmarshal(msg.Data, &payload); err != nil {
+		log.Printf("wg_packet: decode error: %v", err)
+		return
+	}
+	pkt, err := base64.StdEncoding.DecodeString(payload.Packet)
+	if err != nil {
+		log.Printf("wg_packet: base64 decode error: %v", err)
+		return
+	}
+	m.wgBridge.DeliverFromDERP(msg.From, pkt)
 }
 
 func (m *derpManager) handleRouteSetup(msg *derpMessage) {

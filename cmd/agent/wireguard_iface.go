@@ -97,6 +97,19 @@ func (a *PrysmAgent) startWireGuard(ctx context.Context) {
 	log.Printf("wireguard: interface %s up with overlay %s (port %d, %d peers)",
 		w.iface, w.overlayIP, w.listenPort, len(cfg.Peers))
 
+	// Start WG-over-DERP bridge for CLI peers
+	if a.derpManager != nil && w.listenPort > 0 {
+		bridge, err := newWGDERPBridge(a.derpManager, w.listenPort)
+		if err != nil {
+			log.Printf("wireguard: failed to start DERP bridge: %v", err)
+		} else {
+			a.derpManager.wgBridge = bridge
+			log.Printf("wireguard: DERP bridge active on port %d (bridging to WG port %d)", bridge.BridgePort(), w.listenPort)
+			// Add CLI device peers with bridge endpoint
+			w.addDERPPeers(cfg, bridge.BridgePort())
+		}
+	}
+
 	// Reconciliation loop
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
@@ -277,6 +290,24 @@ func (w *wgManager) reconcilePeers(peers []wgPeer) error {
 		}
 	}
 	return nil
+}
+
+// addDERPPeers adds CLI device peers that use the DERP bridge as their endpoint.
+// These peers have an "endpoint" field in the config that is a device ID (not host:port).
+func (w *wgManager) addDERPPeers(cfg *wgNetworkConfig, bridgePort int) {
+	for _, p := range cfg.Peers {
+		// CLI device peers have an "endpoint" that looks like a device ID (no colon = not host:port)
+		if p.Endpoint == "" || strings.Contains(p.Endpoint, ":") {
+			continue // skip cluster peers with host:port endpoints
+		}
+		// This is a DERP-transported peer — use the bridge as its endpoint
+		bridgeEndpoint := fmt.Sprintf("127.0.0.1:%d", bridgePort)
+		if err := w.addPeer(p.PublicKey, bridgeEndpoint, p.AllowedIPs); err != nil {
+			log.Printf("wireguard: add DERP peer %s failed: %v", shortKey(p.PublicKey), err)
+		} else {
+			log.Printf("wireguard: added DERP peer %s via bridge port %d", shortKey(p.PublicKey), bridgePort)
+		}
+	}
 }
 
 func (w *wgManager) stop() error {

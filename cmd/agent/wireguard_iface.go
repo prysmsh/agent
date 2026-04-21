@@ -278,6 +278,14 @@ func (w *wgManager) addPeer(pubKey, endpoint string, allowedIPs []string) error 
 		}
 	}
 
+	// Add routes for allowed IPs so the kernel can route decrypted replies.
+	for _, cidr := range allowedIPs {
+		if cidr == "" {
+			continue
+		}
+		_ = runCmd("ip", "route", "replace", cidr, "dev", w.iface)
+	}
+
 	log.Printf("wireguard: added peer %s endpoint=%s allowed=%s",
 		shortKey(pubKey), endpoint, strings.Join(allowedIPs, ","))
 	return nil

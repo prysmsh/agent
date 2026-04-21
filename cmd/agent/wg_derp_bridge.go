@@ -71,9 +71,9 @@ func (b *wgDERPBridge) BridgePort() int {
 func (b *wgDERPBridge) DeliverFromDERP(fromPeerID string, packet []byte) {
 	wgAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: b.wgPort}
 
+	log.Printf("wg-derp bridge: DeliverFromDERP peer=%s size=%d -> 127.0.0.1:%d", fromPeerID, len(packet), b.wgPort)
+
 	// Send the raw WG packet to the kernel WG interface via UDP.
-	// We send from the bridge socket — kernel WG will see the bridge's port as
-	// the source and will reply to it (this is how we capture responses).
 	_, err := b.bridgeConn.WriteToUDP(packet, wgAddr)
 	if err != nil {
 		log.Printf("wg-derp bridge: write to kernel WG: %v", err)
@@ -91,28 +91,20 @@ func (b *wgDERPBridge) DeliverFromDERP(fromPeerID string, packet []byte) {
 // These are encrypted WG response packets destined for the CLI peer.
 func (b *wgDERPBridge) readLoop() {
 	buf := make([]byte, 65536)
+	log.Printf("wg-derp bridge: readLoop started, listening on port %d", b.bridgePort)
 	for {
 		n, remoteAddr, err := b.bridgeConn.ReadFromUDP(buf)
 		if err != nil {
-			// Socket closed
+			log.Printf("wg-derp bridge: readLoop error: %v", err)
 			return
 		}
 		if n == 0 {
 			continue
 		}
 
-		// The remote addr is 127.0.0.1:wgPort (kernel WG's listen port).
-		// We need to figure out which peer this reply is for.
-		// Since we only have one WG port, and the packet is a WG response,
-		// we look at recent peers. For simplicity with a single peer scenario,
-		// we route to the last peer that sent us a packet.
-		// For multiple peers, WG includes the peer's public key in the handshake,
-		// but parsing that is complex. Instead we use the fact that kernel WG
-		// associates replies with the peer's endpoint — our bridge port.
-		_ = remoteAddr
+		log.Printf("wg-derp bridge: readLoop got %d bytes from %s", n, remoteAddr)
 
-		// Find the target peer — for now we broadcast to all known DERP peers.
-		// In practice with one CLI peer, this works correctly.
+		// Find the target peer — broadcast to all known DERP peers.
 		b.mu.Lock()
 		peers := make([]string, 0, len(b.peerByAddr))
 		seen := make(map[string]bool)
@@ -124,10 +116,16 @@ func (b *wgDERPBridge) readLoop() {
 		}
 		b.mu.Unlock()
 
+		if len(peers) == 0 {
+			log.Printf("wg-derp bridge: readLoop no known peers to forward to")
+			continue
+		}
+
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
 
 		for _, peerID := range peers {
+			log.Printf("wg-derp bridge: forwarding %d bytes to DERP peer %s", n, peerID)
 			b.sendWGPacketToDERP(peerID, packet)
 		}
 	}

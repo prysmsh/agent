@@ -88,6 +88,7 @@ type PrysmAgent struct {
 	mtlsClient      *MTLSClient
 	tunnelDaemon    *tunnelDaemon
 	ccRouteManager  *crossClusterRouteManager
+	wgManager       *wgManager
 	ComponentConfig AgentComponentConfig
 }
 
@@ -281,6 +282,12 @@ func main() {
 
 	// Exit node controller: when cluster is exit router, enable IP forwarding and NAT
 	agent.startExitNodeController(ctx)
+
+	// WireGuard overlay interface
+	if getEnvOrDefault("WIREGUARD_ENABLED", "true") != "false" {
+		go agent.startWireGuard(ctx)
+	}
+
 	if agent.clientset != nil {
 		go agent.clusterTelemetryLoop(ctx)
 		go agent.vulnerabilityScannerLoop(ctx)

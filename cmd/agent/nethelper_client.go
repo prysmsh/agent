@@ -128,3 +128,15 @@ func (c *nethelperClient) peerSet(publicKey, endpoint string, allowedIPs []strin
 	})
 	return err
 }
+
+func (c *nethelperClient) routeReplace(cidr string) error {
+	_, err := c.call("route.replace", map[string]string{
+		"cidr": cidr,
+	})
+	return err
+}
+
+func (c *nethelperClient) iptablesEnsureAccept() error {
+	_, err := c.call("iptables.ensureAccept", nil)
+	return err
+}

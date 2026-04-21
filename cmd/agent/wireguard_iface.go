@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	wgKeyPath  = "/var/lib/prysm-agent/wg-prysm.key"
-	wgPubPath  = "/var/lib/prysm-agent/wg-prysm.pub"
-	wgIfacName = "wg-prysm"
+	wgKeyPath  = "/var/lib/prysm-agent/prysm0.key"
+	wgPubPath  = "/var/lib/prysm-agent/prysm0.pub"
+	wgIfacName = "prysm0"
 )
 
 func shortKey(k string) string {
@@ -53,6 +53,17 @@ func (a *PrysmAgent) startWireGuard(ctx context.Context) {
 	// Always create the nethelper client; we detect availability on
 	// the first real call (iface.create) to avoid a TOCTOU race.
 	nhc := newNethelperClient()
+
+	// Migrate old key files (wg-prysm.key -> prysm0.key).
+	oldKeyPath := strings.Replace(wgKeyPath, "prysm0", "wg-prysm", 1)
+	oldPubPath := strings.Replace(wgPubPath, "prysm0", "wg-prysm", 1)
+	if _, err := os.Stat(wgKeyPath); os.IsNotExist(err) {
+		if _, err := os.Stat(oldKeyPath); err == nil {
+			_ = os.Rename(oldKeyPath, wgKeyPath)
+			_ = os.Rename(oldPubPath, wgPubPath)
+			log.Printf("wireguard: migrated key files from wg-prysm to prysm0")
+		}
+	}
 
 	// Read existing key pair
 	privKeyBytes, err := os.ReadFile(wgKeyPath)
@@ -100,12 +111,9 @@ func (a *PrysmAgent) startWireGuard(ctx context.Context) {
 	// Allow WG overlay traffic through Tailscale's iptables rules.
 	// Tailscale drops all 100.64.0.0/10 traffic not on tailscale0, which
 	// includes Prysm's overlay IPs (100.96.x.x, 100.100.x.x).
-	if err := runCmd("iptables", "-C", "ts-input", "-i", w.iface, "-j", "ACCEPT"); err != nil {
-		// Rule doesn't exist yet — ts-input chain may not exist either (no Tailscale).
-		if err2 := runCmd("iptables", "-I", "ts-input", "3", "-i", w.iface, "-j", "ACCEPT"); err2 != nil {
-			log.Printf("wireguard: iptables ts-input accept for %s: %v (non-fatal)", w.iface, err2)
-		} else {
-			log.Printf("wireguard: added iptables ACCEPT for %s in ts-input", w.iface)
+	if w.nh != nil {
+		if err := w.nh.iptablesEnsureAccept(); err != nil {
+			log.Printf("wireguard: iptables ensure accept: %v (non-fatal)", err)
 		}
 	}
 
@@ -295,7 +303,11 @@ func (w *wgManager) addPeer(pubKey, endpoint string, allowedIPs []string) error 
 		if cidr == "" {
 			continue
 		}
-		_ = runCmd("ip", "route", "replace", cidr, "dev", w.iface)
+		if w.nh != nil {
+			_ = w.nh.routeReplace(cidr)
+		} else {
+			_ = runCmd("ip", "route", "replace", cidr, "dev", w.iface)
+		}
 	}
 
 	log.Printf("wireguard: added peer %s endpoint=%s allowed=%s",

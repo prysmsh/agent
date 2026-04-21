@@ -150,7 +150,7 @@ func newDERPManager(agent *PrysmAgent) (*derpManager, error) {
 		return nil, fmt.Errorf("ensure state directory: %w", err)
 	}
 
-	iface := strings.TrimSpace(getEnvOrDefault("WIREGUARD_INTERFACE", "wg-prysm"))
+	iface := strings.TrimSpace(getEnvOrDefault("WIREGUARD_INTERFACE", "prysm0"))
 	privPath := filepath.Join(stateDir, iface+".key")
 	pubPath := filepath.Join(stateDir, iface+".pub")
 	_, pubKey, err := ensureKeyPair(privPath, pubPath)

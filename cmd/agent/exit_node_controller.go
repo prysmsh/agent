@@ -362,7 +362,7 @@ func (c *exitNodeController) setIPForwarding(enable bool) error {
 func (c *exitNodeController) ensureNATRule(overlayCIDR string) error {
 	// iptables -t nat -C POSTROUTING -s <cidr> ! -o <wg_iface> -j MASQUERADE
 	// If rule exists, -C succeeds; else we add it.
-	wgIface := getEnvOrDefault("WIREGUARD_INTERFACE", "wg-prysm")
+	wgIface := getEnvOrDefault("WIREGUARD_INTERFACE", "prysm0")
 
 	checkCmd := exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", overlayCIDR, "!", "-o", wgIface, "-j", "MASQUERADE")
 	if err := checkCmd.Run(); err == nil {
@@ -378,7 +378,7 @@ func (c *exitNodeController) ensureNATRule(overlayCIDR string) error {
 
 func (c *exitNodeController) removeNATRule() {
 	overlayCIDR := getEnvOrDefault("EXIT_NODE_OVERLAY_CIDR", "100.96.0.0/11")
-	wgIface := getEnvOrDefault("WIREGUARD_INTERFACE", "wg-prysm")
+	wgIface := getEnvOrDefault("WIREGUARD_INTERFACE", "prysm0")
 
 	cmd := exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", overlayCIDR, "!", "-o", wgIface, "-j", "MASQUERADE")
 	if out, err := cmd.CombinedOutput(); err != nil {

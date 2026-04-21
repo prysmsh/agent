@@ -17,7 +17,7 @@ import (
 
 const (
 	socketPath = "/var/run/prysm/nethelper.sock"
-	ifaceName  = "wg-prysm"
+	ifaceName  = "prysm0"
 	keyBaseDir = "/var/lib/prysm-agent/"
 	prysmGID   = 1001
 )
@@ -48,6 +48,11 @@ type ifaceCreateParams struct {
 
 type ifaceAddAddrParams struct {
 	CIDR string `json:"cidr"`
+}
+
+type routeReplaceParams struct {
+	CIDR string `json:"cidr"`
+	Dev  string `json:"dev"`
 }
 
 type peerSetParams struct {
@@ -240,6 +245,41 @@ func dispatch(req jsonRPCRequest) jsonRPCResponse {
 			return fail(-32000, "wg set peer: "+err.Error())
 		}
 		return ok("set")
+
+	case "route.replace":
+		var p routeReplaceParams
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return fail(-32602, "invalid params: "+err.Error())
+		}
+		if err := validateCIDR(p.CIDR); err != nil {
+			return fail(-32602, err.Error())
+		}
+		dev := p.Dev
+		if dev == "" {
+			dev = ifaceName
+		}
+		log.Printf("route.replace cidr=%s dev=%s", p.CIDR, dev)
+		if err := runCmd("ip", "route", "replace", p.CIDR, "dev", dev); err != nil {
+			return fail(-32000, "ip route replace: "+err.Error())
+		}
+		return ok("replaced")
+
+	case "iptables.ensureAccept":
+		// Ensure an ACCEPT rule exists in ts-input for the WG interface.
+		// This is needed because Tailscale drops 100.64.0.0/10 traffic
+		// from non-tailscale0 interfaces.
+		log.Printf("iptables.ensureAccept iface=%s", ifaceName)
+		// Check if rule already exists.
+		if err := runCmd("iptables", "-C", "ts-input", "-i", ifaceName, "-j", "ACCEPT"); err == nil {
+			return ok("exists")
+		}
+		// Insert before the DROP rule (position 3 in ts-input).
+		if err := runCmd("iptables", "-I", "ts-input", "3", "-i", ifaceName, "-j", "ACCEPT"); err != nil {
+			// ts-input chain might not exist (no Tailscale). Non-fatal.
+			log.Printf("iptables.ensureAccept: %v (non-fatal)", err)
+			return ok("skipped")
+		}
+		return ok("added")
 
 	default:
 		return fail(-32601, "method not found: "+req.Method)

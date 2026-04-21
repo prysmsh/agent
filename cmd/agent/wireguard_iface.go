@@ -97,6 +97,18 @@ func (a *PrysmAgent) startWireGuard(ctx context.Context) {
 	log.Printf("wireguard: interface %s up with overlay %s (port %d, %d peers)",
 		w.iface, w.overlayIP, w.listenPort, len(cfg.Peers))
 
+	// Allow WG overlay traffic through Tailscale's iptables rules.
+	// Tailscale drops all 100.64.0.0/10 traffic not on tailscale0, which
+	// includes Prysm's overlay IPs (100.96.x.x, 100.100.x.x).
+	if err := runCmd("iptables", "-C", "ts-input", "-i", w.iface, "-j", "ACCEPT"); err != nil {
+		// Rule doesn't exist yet — ts-input chain may not exist either (no Tailscale).
+		if err2 := runCmd("iptables", "-I", "ts-input", "3", "-i", w.iface, "-j", "ACCEPT"); err2 != nil {
+			log.Printf("wireguard: iptables ts-input accept for %s: %v (non-fatal)", w.iface, err2)
+		} else {
+			log.Printf("wireguard: added iptables ACCEPT for %s in ts-input", w.iface)
+		}
+	}
+
 	// Start WG-over-DERP bridge for CLI peers
 	if a.derpManager != nil && w.listenPort > 0 {
 		bridge, err := newWGDERPBridge(a.derpManager, w.listenPort)
@@ -293,6 +305,12 @@ func (w *wgManager) addPeer(pubKey, endpoint string, allowedIPs []string) error 
 
 func (w *wgManager) reconcilePeers(peers []wgPeer) error {
 	for _, p := range peers {
+		// Skip CLI device peers (endpoint is a device ID, not host:port).
+		// These are managed by the DERP bridge and shouldn't be reconciled
+		// with raw endpoints — doing so overwrites the bridge endpoint.
+		if p.Endpoint != "" && !strings.Contains(p.Endpoint, ":") {
+			continue
+		}
 		if err := w.addPeer(p.PublicKey, p.Endpoint, p.AllowedIPs); err != nil {
 			log.Printf("wireguard: reconcile peer %s failed: %v", shortKey(p.PublicKey), err)
 		}

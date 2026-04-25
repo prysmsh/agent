@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,7 +18,9 @@ type edgeDomainConfig struct {
 	Domain         string           `json:"domain"`
 	UpstreamTarget string           `json:"upstream_target"`
 	UpstreamMode   string           `json:"upstream_mode"`
+	Proxied        bool             `json:"proxied"`
 	Status         string           `json:"status"`
+	DNSRecords     json.RawMessage  `json:"dns_records"`
 	Rules          []edgeRuleConfig `json:"rules"`
 }
 
@@ -35,10 +38,12 @@ type edgeConfigResponse struct {
 }
 
 type edgeSyncer struct {
-	agent    *PrysmAgent
-	mu       sync.RWMutex
-	domains  []edgeDomainConfig
-	interval time.Duration
+	agent      *PrysmAgent
+	mu         sync.RWMutex
+	domains    []edgeDomainConfig
+	configHash string
+	interval   time.Duration
+	onChange   func()
 }
 
 func newEdgeSyncer(agent *PrysmAgent) *edgeSyncer {
@@ -102,9 +107,18 @@ func (s *edgeSyncer) fetch(ctx context.Context) {
 		return
 	}
 
+	raw, _ := json.Marshal(cfg.Domains)
+	newHash := fmt.Sprintf("%x", sha256.Sum256(raw))
+
 	s.mu.Lock()
+	changed := s.configHash != newHash
 	s.domains = cfg.Domains
+	s.configHash = newHash
 	s.mu.Unlock()
+
+	if changed && s.onChange != nil {
+		s.onChange()
+	}
 
 	if len(cfg.Domains) > 0 {
 		names := make([]string, len(cfg.Domains))

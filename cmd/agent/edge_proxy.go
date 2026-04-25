@@ -22,7 +22,9 @@ type edgeProxy struct {
 	httpsPort int
 	acmeEmail string
 	staging   bool
-	certMagic *certmagic.Config
+	certMagic   *certmagic.Config
+	wafClient   *warpVectorClient
+	embedFn     func(string) []float32
 }
 
 func newEdgeProxy(syncer *edgeSyncer, httpPort, httpsPort int, acmeEmail string, staging bool) *edgeProxy {
@@ -136,6 +138,19 @@ func (p *edgeProxy) handleHTTPS(w http.ResponseWriter, r *http.Request) {
 	if !domain.Proxied {
 		http.Error(w, "domain is DNS-only", http.StatusBadGateway)
 		return
+	}
+
+	// AI WAF inline check
+	if p.wafClient != nil && p.embedFn != nil {
+		result := checkRequest(r, p.embedFn, p.wafClient)
+		if result.Blocked {
+			log.Printf("ai-waf: blocked %s %s from %s (threat=%s score=%.2f latency=%s)",
+				r.Method, r.URL.Path, r.RemoteAddr, result.ThreatType, result.Score, result.Latency)
+			w.Header().Set("X-Prysm-WAF", "blocked")
+			w.Header().Set("X-Prysm-Threat", result.ThreatType)
+			http.Error(w, "Request blocked by AI WAF", http.StatusForbidden)
+			return
+		}
 	}
 
 	upstream, err := url.Parse("http://" + domain.UpstreamTarget)

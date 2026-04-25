@@ -314,6 +314,10 @@ func main() {
 		acmeEmail := getEnvOrDefault("EDGE_ACME_EMAIL", "")
 		staging := getEnvOrDefault("EDGE_ACME_STAGING", "") == "true"
 		proxy := newEdgeProxy(edgeSync, httpPort, httpsPort, acmeEmail, staging)
+		if warpURL := getEnvOrDefault("WARP_VECTOR_URL", ""); warpURL != "" {
+			proxy.wafClient = newWarpVectorClient(warpURL)
+			log.Printf("ai-waf: enabled, vector store at %s", warpURL)
+		}
 		if err := proxy.start(ctx); err != nil {
 			log.Printf("edge-proxy: failed to start: %v", err)
 		}

@@ -30,11 +30,15 @@ func newEmbedClient(baseURL, model string) *embedClient {
 // embed sends text to prysm-ai and returns a vector.
 func (c *embedClient) embed(text string) []float32 {
 	body, _ := json.Marshal(map[string]string{"text": text, "model": c.model})
-	resp, err := c.httpClient.Post(
-		c.baseURL+"/embed/text",
-		"application/json",
-		bytes.NewReader(body),
-	)
+	req, err := http.NewRequest("POST", c.baseURL+"/embed/text", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("ai-waf: embed request creation failed: %v", err)
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Organization-ID", "0")
+	req.Header.Set("X-User-ID", "0")
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		log.Printf("ai-waf: embed request failed: %v", err)
 		return nil

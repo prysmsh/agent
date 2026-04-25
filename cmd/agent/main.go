@@ -316,7 +316,18 @@ func main() {
 		proxy := newEdgeProxy(edgeSync, httpPort, httpsPort, acmeEmail, staging)
 		if warpURL := getEnvOrDefault("WARP_VECTOR_URL", ""); warpURL != "" {
 			proxy.wafClient = newWarpVectorClient(warpURL)
-			log.Printf("ai-waf: enabled, vector store at %s", warpURL)
+			embedURL := getEnvOrDefault("EMBED_URL", "http://prysm-ai:8090")
+			embedModel := getEnvOrDefault("EMBED_MODEL", "minilm")
+			ec := newEmbedClient(embedURL, embedModel)
+			proxy.embedFn = ec.embed
+			log.Printf("ai-waf: enabled (vectors=%s embed=%s model=%s)", warpURL, embedURL, embedModel)
+
+			// Seed attack vectors in background
+			go func() {
+				if err := seedAttackVectors(ec, proxy.wafClient); err != nil {
+					log.Printf("ai-waf: seed failed: %v (will retry on next restart)", err)
+				}
+			}()
 		}
 		if err := proxy.start(ctx); err != nil {
 			log.Printf("edge-proxy: failed to start: %v", err)

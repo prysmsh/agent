@@ -300,6 +300,24 @@ func main() {
 		}
 	}
 
+	// Edge HTTPS reverse proxy (ACME auto-TLS)
+	if getEnvOrDefault("EDGE_PROXY_ENABLED", "") == "true" || getEnvOrDefault("EDGE_PROXY_ENABLED", "") == "1" {
+		httpPort := 80
+		httpsPort := 443
+		if p, err := strconv.Atoi(getEnvOrDefault("EDGE_HTTP_PORT", "")); err == nil && p > 0 {
+			httpPort = p
+		}
+		if p, err := strconv.Atoi(getEnvOrDefault("EDGE_HTTPS_PORT", "")); err == nil && p > 0 {
+			httpsPort = p
+		}
+		acmeEmail := getEnvOrDefault("EDGE_ACME_EMAIL", "")
+		staging := getEnvOrDefault("EDGE_ACME_STAGING", "") == "true"
+		proxy := newEdgeProxy(edgeSync, httpPort, httpsPort, acmeEmail, staging)
+		if err := proxy.start(ctx); err != nil {
+			log.Printf("edge-proxy: failed to start: %v", err)
+		}
+	}
+
 	// Exit node controller: when cluster is exit router, enable IP forwarding and NAT
 	agent.startExitNodeController(ctx)
 

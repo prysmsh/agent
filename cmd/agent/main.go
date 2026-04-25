@@ -284,6 +284,22 @@ func main() {
 	edgeSync := newEdgeSyncer(agent)
 	go edgeSync.run(ctx)
 
+	// Edge authoritative DNS server
+	if edgeDNSPort := getEnvOrDefault("EDGE_DNS_PORT", ""); edgeDNSPort != "" {
+		port := 53
+		if p, err := strconv.Atoi(edgeDNSPort); err == nil && p > 0 {
+			port = p
+		}
+		edgeIP := getEnvOrDefault("EDGE_DNS_IP", "127.0.0.1")
+		dnsServer := newEdgeDNS(edgeSync, edgeIP, port)
+		edgeSync.onChange = func() {
+			log.Printf("edge-dns: zone config updated, %d domain(s)", len(edgeSync.getDomains()))
+		}
+		if err := dnsServer.start(); err != nil {
+			log.Printf("edge-dns: failed to start: %v", err)
+		}
+	}
+
 	// Exit node controller: when cluster is exit router, enable IP forwarding and NAT
 	agent.startExitNodeController(ctx)
 

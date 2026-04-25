@@ -280,6 +280,10 @@ func main() {
 		}
 	}
 
+	// Edge proxy config sync
+	edgeSync := newEdgeSyncer(agent)
+	go edgeSync.run(ctx)
+
 	// Exit node controller: when cluster is exit router, enable IP forwarding and NAT
 	agent.startExitNodeController(ctx)
 

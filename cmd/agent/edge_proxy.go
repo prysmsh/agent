@@ -11,6 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -181,10 +182,7 @@ func (p *edgeProxy) handleHTTPS(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "upstream unreachable", http.StatusBadGateway)
 		},
 		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
+			DialContext: ssrfSafeDialer().DialContext,
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     90 * time.Second,
@@ -219,6 +217,58 @@ func generateRequestID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return fmt.Sprintf("%x", b)
+}
+
+// ssrfSafeDialer returns a net.Dialer wrapped with IP validation that blocks
+// connections to private, loopback, link-local, and multicast addresses.
+// This prevents SSRF attacks where an attacker sets upstream_target to an
+// internal IP (e.g. 169.254.169.254 for cloud metadata).
+func ssrfSafeDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return fmt.Errorf("ssrf: invalid address %q", address)
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				return fmt.Errorf("ssrf: cannot parse IP %q", host)
+			}
+			if isPrivateIP(ip) {
+				return fmt.Errorf("ssrf: blocked connection to private IP %s", ip)
+			}
+			return nil
+		},
+	}
+}
+
+func isPrivateIP(ip net.IP) bool {
+	privateRanges := []struct {
+		network *net.IPNet
+	}{
+		{parseCIDR("10.0.0.0/8")},
+		{parseCIDR("172.16.0.0/12")},
+		{parseCIDR("192.168.0.0/16")},
+		{parseCIDR("127.0.0.0/8")},
+		{parseCIDR("169.254.0.0/16")},
+		{parseCIDR("224.0.0.0/4")},
+		{parseCIDR("::1/128")},
+		{parseCIDR("fe80::/10")},
+		{parseCIDR("fc00::/7")},
+	}
+	for _, r := range privateRanges {
+		if r.network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseCIDR(s string) *net.IPNet {
+	_, network, _ := net.ParseCIDR(s)
+	return network
 }
 
 func chainOnChange(existing func(), additional func()) func() {

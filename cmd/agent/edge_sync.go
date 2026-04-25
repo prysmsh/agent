@@ -44,6 +44,7 @@ type edgeSyncer struct {
 	configHash string
 	interval   time.Duration
 	onChange   func()
+	popMode    bool // true = edge PoP (fetch all domains), false = customer agent (fetch own cluster's domains)
 }
 
 func newEdgeSyncer(agent *PrysmAgent) *edgeSyncer {
@@ -75,7 +76,11 @@ func (s *edgeSyncer) run(ctx context.Context) {
 }
 
 func (s *edgeSyncer) fetch(ctx context.Context) {
-	url := s.agent.BackendURL + "/api/v1/agent/edge/config"
+	endpoint := "/api/v1/agent/edge/config"
+	if s.popMode {
+		endpoint = "/api/v1/agent/edge/pop-config"
+	}
+	url := s.agent.BackendURL + endpoint
 
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

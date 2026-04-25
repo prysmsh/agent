@@ -282,6 +282,7 @@ func main() {
 
 	// Edge proxy config sync
 	edgeSync := newEdgeSyncer(agent)
+	edgeSync.popMode = getEnvOrDefault("EDGE_POP", "") == "true"
 	go edgeSync.run(ctx)
 
 	// Edge authoritative DNS server

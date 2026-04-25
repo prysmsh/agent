@@ -245,15 +245,20 @@ func ssrfSafeDialer() *net.Dialer {
 }
 
 func isPrivateIP(ip net.IP) bool {
+	if ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLoopback() {
+		return true
+	}
 	privateRanges := []struct {
 		network *net.IPNet
 	}{
+		{parseCIDR("0.0.0.0/8")},
 		{parseCIDR("10.0.0.0/8")},
 		{parseCIDR("172.16.0.0/12")},
 		{parseCIDR("192.168.0.0/16")},
 		{parseCIDR("127.0.0.0/8")},
 		{parseCIDR("169.254.0.0/16")},
 		{parseCIDR("224.0.0.0/4")},
+		{parseCIDR("255.255.255.255/32")},
 		{parseCIDR("::1/128")},
 		{parseCIDR("fe80::/10")},
 		{parseCIDR("fc00::/7")},

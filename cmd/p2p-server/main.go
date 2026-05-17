@@ -606,7 +606,13 @@ func (s *P2PDERPServer) connectToPeer(address string) {
 
 	wsURL := fmt.Sprintf("wss://%s/server", address)
 
-	tlsConfig := &tls.Config{InsecureSkipVerify: true}
+	// Default: verify peer TLS cert against the system trust store.
+	// Override only behind explicit dev flag P2P_INSECURE_SKIP_VERIFY=1
+	// (set by local dev runs; never in production deployments).
+	tlsConfig := &tls.Config{InsecureSkipVerify: os.Getenv("P2P_INSECURE_SKIP_VERIFY") == "1"}
+	if tlsConfig.InsecureSkipVerify {
+		log.Printf("[%s] WARNING: P2P_INSECURE_SKIP_VERIFY=1 — skipping TLS verification for peer dial to %s", s.ID, address)
+	}
 	tlsutil.ApplyPQCConfig(tlsConfig)
 	dialer := websocket.Dialer{
 		TLSClientConfig: tlsConfig,

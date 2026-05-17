@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 )
@@ -228,6 +229,9 @@ func dispatch(req jsonRPCRequest) jsonRPCResponse {
 				return fail(-32602, "invalid allowed_ip: "+err.Error())
 			}
 		}
+		if err := validateEndpoint(p.Endpoint); err != nil {
+			return fail(-32602, "invalid endpoint: "+err.Error())
+		}
 		pubPrefix := p.PublicKey
 		if len(pubPrefix) > 16 {
 			pubPrefix = pubPrefix[:16]
@@ -298,6 +302,24 @@ func validateCIDR(cidr string) error {
 	_, _, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return fmt.Errorf("invalid CIDR %q: %v", cidr, err)
+	}
+	return nil
+}
+
+// validateEndpoint accepts host:port (IPv4, IPv6 in brackets, or DNS name).
+// Rejects leading '-' so wg(8) can't reinterpret the value as a flag, and
+// requires an explicit numeric port to keep the surface tight.
+var endpointRegex = regexp.MustCompile(`^[A-Za-z0-9.\-:\[\]]+:[0-9]{1,5}$`)
+
+func validateEndpoint(ep string) error {
+	if ep == "" {
+		return nil
+	}
+	if strings.HasPrefix(ep, "-") {
+		return fmt.Errorf("endpoint must not start with '-'")
+	}
+	if !endpointRegex.MatchString(ep) {
+		return fmt.Errorf("invalid endpoint %q (expected host:port)", ep)
 	}
 	return nil
 }
